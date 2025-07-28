@@ -7,7 +7,7 @@
 TEST_CONTROL_PORT=17000
 TEST_PROXY_PORT=17001
 TEST_PUBLIC_PORT=18080
-TEST_LOCAL_PORT=13000
+TEST_LOCAL_PORT=11434
 
 FRPS_LOG="frps.log"
 FRPC_A_LOG="frpc_a.log"
@@ -30,8 +30,13 @@ cleanup() {
     if [ -n "$FRPS_PID" ]; then kill $FRPS_PID &> /dev/null; fi
     if [ -n "$FRPC_A_PID" ]; then kill $FRPC_A_PID &> /dev/null; fi
     if [ -n "$FRPC_B_PID" ]; then kill $FRPC_B_PID &> /dev/null; fi
-    rm -f $FRPS_LOG $FRPC_A_LOG $FRPC_B_LOG $HTTP_SERVER_LOG
-    echo "[INFO] Cleanup complete."
+    # Only remove log files if the test passed
+    if [ $? -eq 0 ]; then 
+        rm -f $FRPS_LOG $FRPC_A_LOG $FRPC_B_LOG $HTTP_SERVER_LOG token.json
+        echo "[INFO] Cleanup complete."
+    else
+        echo "[INFO] Keeping log files for debugging. Cleanup incomplete."
+    fi
 }
 
 # --- Helper Functions ---
@@ -65,6 +70,7 @@ echo "[INFO] Performing pre-test cleanup..."
 pkill -f "target/release/frps_demo" &> /dev/null
 pkill -f "target/release/frpc_demo" &> /dev/null
 pkill -f "python3 -m http.server" &> /dev/null
+rm -f token.json  # Remove any existing token file
 sleep 1
 
 # Trap EXIT signal to ensure cleanup runs
@@ -91,11 +97,11 @@ echo "- frps_demo server started (PID: $FRPS_PID)"
 
 wait_for_log $FRPS_LOG "FRPS listening on ports" $WAIT_TIMEOUT || exit 1
 
-./target/release/frpc_demo --client-id client_A --control-port ${TEST_CONTROL_PORT} --proxy-port ${TEST_PROXY_PORT} --local-port ${TEST_LOCAL_PORT} &> $FRPC_A_LOG &
+./target/release/frpc_demo --client-id client_A --control-port ${TEST_CONTROL_PORT} --proxy-port ${TEST_PROXY_PORT} --local-port ${TEST_LOCAL_PORT} --email test@example.com --password 123456 &> $FRPC_A_LOG &
 FRPC_A_PID=$!
 echo "- frpc_demo client_A started (PID: $FRPC_A_PID)"
 
-./target/release/frpc_demo --client-id client_B --control-port ${TEST_CONTROL_PORT} --proxy-port ${TEST_PROXY_PORT} --local-port ${TEST_LOCAL_PORT} &> $FRPC_B_LOG &
+./target/release/frpc_demo --client-id client_B --control-port ${TEST_CONTROL_PORT} --proxy-port ${TEST_PROXY_PORT} --local-port ${TEST_LOCAL_PORT} --email test@example.com --password 123456 &> $FRPC_B_LOG &
 FRPC_B_PID=$!
 echo "- frpc_demo client_B started (PID: $FRPC_B_PID)"
 

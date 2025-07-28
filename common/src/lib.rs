@@ -22,6 +22,21 @@ pub enum Command {
     NewProxyConn {
         proxy_conn_id: String,
     },
+    // Login with email and password.
+    Login {
+        email: String,
+        pass: String,
+    },
+    // Login with a token.
+    LoginByToken {
+        token: String,
+    },
+    // Login result.
+    LoginResult {
+        success: bool,
+        error: Option<String>,
+        token: Option<String>,
+    },
 }
 
 /// Reads a command from an async reader.

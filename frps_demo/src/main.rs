@@ -6,28 +6,34 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tokio::net::tcp::{OwnedWriteHalf};
-use tokio::io::AsyncReadExt;
+use tokio::net::tcp::{OwnedWriteHalf, OwnedReadHalf};
 use tracing::{info, warn, error, Level};
 use uuid::Uuid;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    #[arg(long, default_value_t = 7000)]
+    #[arg(long, default_value_t = 17000)]
     control_port: u16,
 
-    #[arg(long, default_value_t = 7001)]
+    #[arg(long, default_value_t = 17001)]
     proxy_port: u16,
 
-    #[arg(long, default_value_t = 8080)]
+    #[arg(long, default_value_t = 18080)]
     public_port: u16,
 }
 
 struct ClientInfo {
     writer: Arc<Mutex<OwnedWriteHalf>>,
+    authed: bool,
 }
 
+struct User {
+    pass: String,
+}
+
+type UserDb = Arc<Mutex<HashMap<String, User>>>;
+type TokenDb = Arc<Mutex<HashMap<String, String>>>;
 type ActiveClients = Arc<Mutex<HashMap<String, ClientInfo>>>;
 type PendingConnections = Arc<Mutex<HashMap<String, TcpStream>>>;
 
@@ -38,6 +44,10 @@ async fn main() -> Result<()> {
 
     let active_clients: ActiveClients = Arc::new(Mutex::new(HashMap::new()));
     let pending_connections: PendingConnections = Arc::new(Mutex::new(HashMap::new()));
+    let user_db: UserDb = Arc::new(Mutex::new(HashMap::from([
+        ("test@example.com".to_string(), User { pass: "123456".to_string() }),
+    ])));
+    let token_db: TokenDb = Arc::new(Mutex::new(HashMap::new()));
 
     let control_listener = TcpListener::bind(format!("0.0.0.0:{}", args.control_port)).await?;
     let proxy_listener = TcpListener::bind(format!("0.0.0.0:{}", args.proxy_port)).await?;
@@ -46,7 +56,7 @@ async fn main() -> Result<()> {
     info!("FRPS listening on ports: Control={}, Proxy={}, Public={}", args.control_port, args.proxy_port, args.public_port);
 
     let server_logic = tokio::select! {
-        res = handle_control_connections(control_listener, active_clients.clone()) => res,
+        res = handle_control_connections(control_listener, active_clients.clone(), user_db, token_db) => res,
         res = handle_proxy_connections(proxy_listener, pending_connections.clone()) => res,
         res = handle_public_connections(public_listener, active_clients.clone(), pending_connections.clone()) => res,
     };
@@ -58,22 +68,60 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn handle_control_connections(listener: TcpListener, active_clients: ActiveClients) -> Result<()> {
+async fn handle_control_connections(listener: TcpListener, active_clients: ActiveClients, user_db: UserDb, token_db: TokenDb) -> Result<()> {
     loop {
         let (stream, addr) = listener.accept().await?;
         info!("New control connection from: {}", addr);
         let active_clients_clone = active_clients.clone();
+        let user_db_clone = user_db.clone();
+        let token_db_clone = token_db.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_single_client(stream, active_clients_clone).await {
+            if let Err(e) = handle_single_client(stream, active_clients_clone, user_db_clone, token_db_clone).await {
                 error!("Error handling client {}: {}", addr, e);
             }
         });
     }
 }
 
-async fn handle_single_client(stream: TcpStream, active_clients: ActiveClients) -> Result<()> {
+async fn handle_single_client(stream: TcpStream, active_clients: ActiveClients, user_db: UserDb, token_db: TokenDb) -> Result<()> {
     let (mut reader, writer) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer));
+    let mut authed = false;
+
+    match read_command(&mut reader).await? {
+        Command::Login { email, pass } => {
+            let users = user_db.lock().await;
+            if let Some(user) = users.get(&email) {
+                if user.pass == pass {
+                    let token = Uuid::new_v4().to_string();
+                    let mut tokens = token_db.lock().await;
+                    tokens.insert(token.clone(), email.clone());
+                    let _ = write_command(&mut *writer.lock().await, &Command::LoginResult { success: true, error: None, token: Some(token) }).await;
+                    authed = true;
+                } else {
+                    let _ = write_command(&mut *writer.lock().await, &Command::LoginResult { success: false, error: Some("Invalid password".to_string()), token: None }).await;
+                }
+            } else {
+                let _ = write_command(&mut *writer.lock().await, &Command::LoginResult { success: false, error: Some("User not found".to_string()), token: None }).await;
+            }
+        }
+        Command::LoginByToken { token } => {
+            let tokens = token_db.lock().await;
+            if tokens.contains_key(&token) {
+                let _ = write_command(&mut *writer.lock().await, &Command::LoginResult { success: true, error: None, token: None }).await;
+                authed = true;
+            } else {
+                let _ = write_command(&mut *writer.lock().await, &Command::LoginResult { success: false, error: Some("Invalid token".to_string()), token: None }).await;
+            }
+        }
+        _ => {
+            return Err(anyhow!("First command was not a login command"));
+        }
+    }
+
+    if !authed {
+        return Ok(());
+    }
 
     let client_id = if let Command::Register { client_id: id } = read_command(&mut reader).await? {
         info!("Registration attempt for client_id: {}", id);
@@ -84,24 +132,30 @@ async fn handle_single_client(stream: TcpStream, active_clients: ActiveClients) 
             return Err(anyhow!("Client ID already registered"));
         }
 
-        clients.insert(id.clone(), ClientInfo { writer: writer.clone() });
+        clients.insert(id.clone(), ClientInfo { writer: writer.clone(), authed });
         let _ = write_command(&mut *writer.lock().await, &Command::RegisterResult { success: true, error: None }).await;
         info!("Client {} registered successfully.", id);
         id
     } else {
-        return Err(anyhow!("First command was not Register"));
+        return Err(anyhow!("Second command was not Register"));
     };
 
-    // Keep reading from the control channel, but we don't expect more commands.
-    // The main purpose is to detect when the client disconnects.
+    client_loop(&mut reader, client_id, active_clients).await
+}
+
+async fn client_loop(reader: &mut OwnedReadHalf, client_id: String, active_clients: ActiveClients) -> Result<()> {
     loop {
-        if reader.read_u8().await.is_err() {
-            warn!("Client {} disconnected.", client_id);
-            active_clients.lock().await.remove(&client_id);
-            break;
+        match read_command(reader).await {
+            Ok(cmd) => {
+                warn!("Received unexpected command: {:?}", cmd);
+            }
+            Err(_) => {
+                warn!("Client {} disconnected.", client_id);
+                active_clients.lock().await.remove(&client_id);
+                break;
+            }
         }
     }
-
     Ok(())
 }
 
@@ -153,7 +207,6 @@ async fn route_public_connection(user_stream: TcpStream, active_clients: ActiveC
 
     if client_ids.is_empty() {
         warn!("No active clients available to handle new public connection.");
-        // user_stream is dropped here, closing the connection.
         return Err(anyhow!("No active clients"));
     }
 
@@ -161,6 +214,9 @@ async fn route_public_connection(user_stream: TcpStream, active_clients: ActiveC
     info!("Chose client '{}' for the new connection.", chosen_client_id);
 
     if let Some(client_info) = clients.get(chosen_client_id) {
+        if !client_info.authed {
+            return Err(anyhow!("Chosen client not authenticated"));
+        }
         let proxy_conn_id = Uuid::new_v4().to_string();
         let command = Command::RequestNewProxyConn { proxy_conn_id: proxy_conn_id.clone() };
 
@@ -170,15 +226,13 @@ async fn route_public_connection(user_stream: TcpStream, active_clients: ActiveC
         let mut writer = client_info.writer.lock().await;
         if let Err(e) = write_command(&mut *writer, &command).await {
             error!("Failed to send RequestNewProxyConn to client {}: {}. Removing from active list.", chosen_client_id, e);
-            // If sending fails, the client is likely disconnected. Remove it.
-            drop(writer); // Release lock before locking clients again
+            drop(writer);
             clients.remove(chosen_client_id);
             pending_connections.lock().await.remove(&proxy_conn_id);
             return Err(e.into());
         }
         info!("Successfully sent RequestNewProxyConn to client {}", chosen_client_id);
     } else {
-        // This should theoretically not happen if the client list is locked.
         error!("Chosen client {} not found in active list.", chosen_client_id);
         return Err(anyhow!("Chosen client disappeared"));
     }

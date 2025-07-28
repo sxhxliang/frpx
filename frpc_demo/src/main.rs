@@ -1,11 +1,14 @@
 use anyhow::{anyhow, Result};
 use clap::Parser;
 use common::{read_command, write_command, join_streams, Command};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io::{self, Write};
+use std::path::Path;
 use tokio::net::TcpStream;
-use tokio::io::{self};
 use tracing::{info, error, warn, Level};
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Unique ID for this client instance.
@@ -17,11 +20,11 @@ struct Args {
     server_addr: String,
 
     /// Port for the frps control connection.
-    #[arg(long, default_value_t = 7000)]
+    #[arg(long, default_value_t = 17000)]
     control_port: u16,
 
     /// Port for the frps proxy connection.
-    #[arg(long, default_value_t = 7001)]
+    #[arg(long, default_value_t = 17001)]
     proxy_port: u16,
 
     /// Address of the local service to expose.
@@ -29,8 +32,21 @@ struct Args {
     local_addr: String,
 
     /// Port of the local service to expose.
-    #[arg(long, default_value_t = 3000)]
+    #[arg(long, default_value_t = 11434)]
     local_port: u16,
+
+    /// Email for authentication (skip interactive input)
+    #[arg(long)]
+    email: Option<String>,
+
+    /// Password for authentication (skip interactive input)
+    #[arg(long)]
+    password: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TokenData {
+    token: String,
 }
 
 #[tokio::main]
@@ -46,6 +62,53 @@ async fn main() -> Result<()> {
     info!("Connected to control port.");
 
     let (mut reader, mut writer) = tokio::io::split(control_stream);
+
+    let token_path = Path::new("token.json");
+    if token_path.exists() {
+        let token_data: TokenData = serde_json::from_str(&fs::read_to_string(token_path)?)?;
+        let login_cmd = Command::LoginByToken { token: token_data.token };
+        write_command(&mut writer, &login_cmd).await?;
+    } else if let (Some(email), Some(password)) = (args.email.clone(), args.password.clone()) {
+        // Use provided credentials
+        let login_cmd = Command::Login {
+            email,
+            pass: password,
+        };
+        write_command(&mut writer, &login_cmd).await?;
+    } else {
+        print!("Enter email: ");
+        io::stdout().flush()?;
+        let mut email = String::new();
+        io::stdin().read_line(&mut email)?;
+
+        print!("Enter password: ");
+        io::stdout().flush()?;
+        let mut pass = String::new();
+        io::stdin().read_line(&mut pass)?;
+
+        let login_cmd = Command::Login {
+            email: email.trim().to_string(),
+            pass: pass.trim().to_string(),
+        };
+        write_command(&mut writer, &login_cmd).await?;
+    }
+
+    match read_command(&mut reader).await? {
+        Command::LoginResult { success, error, token } => {
+            if success {
+                if let Some(token) = token {
+                    fs::write("token.json", serde_json::to_string(&TokenData { token })?)?;
+                }
+                info!("Successfully logged in.");
+            } else {
+                error!("Login failed: {}", error.unwrap_or_default());
+                return Err(anyhow!("Login failed"));
+            }
+        }
+        _ => {
+            return Err(anyhow!("Received unexpected command after login attempt."));
+        }
+    }
 
     // Register the client
     let register_cmd = Command::Register { client_id: args.client_id.clone() };
@@ -111,18 +174,4 @@ async fn create_proxy_connection(args: Args, proxy_conn_id: String) -> Result<()
     info!("('{}') Streams joined and finished.", proxy_conn_id);
 
     Ok(())
-}
-
-// We need to implement Clone for Args to use it in the spawned task.
-impl Clone for Args {
-    fn clone(&self) -> Self {
-        Args {
-            client_id: self.client_id.clone(),
-            server_addr: self.server_addr.clone(),
-            control_port: self.control_port,
-            proxy_port: self.proxy_port,
-            local_addr: self.local_addr.clone(),
-            local_port: self.local_port,
-        }
-    }
 }
