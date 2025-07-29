@@ -37,6 +37,14 @@ pub enum Command {
         error: Option<String>,
         token: Option<String>,
     },
+    /// Heartbeat message from client to server
+    Heartbeat,
+    /// System information from client to server
+    SystemInfo {
+        cpu_usage: f32,
+        memory_usage: f32,
+        disk_usage: f32,
+    },
 }
 
 /// Reads a command from an async reader.

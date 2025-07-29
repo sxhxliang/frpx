@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
+use std::time::Duration;
 use tokio::net::TcpStream;
+use tokio::time::interval;
 use tracing::{info, error, warn, Level};
 
 #[derive(Parser, Debug, Clone)]
@@ -47,6 +49,13 @@ struct Args {
 #[derive(Serialize, Deserialize)]
 struct TokenData {
     token: String,
+}
+
+#[derive(Debug)]
+struct SystemInfo {
+    cpu_usage: f32,
+    memory_usage: f32,
+    disk_usage: f32,
 }
 
 #[tokio::main]
@@ -129,6 +138,36 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Clone necessary variables for the heartbeat task
+    let mut writer_clone = writer;
+    let args_clone = args.clone();
+    
+    // Spawn a task to send periodic heartbeats and system info
+    tokio::spawn(async move {
+        let mut interval = interval(Duration::from_secs(30)); // Send heartbeat every 30 seconds
+        loop {
+            interval.tick().await;
+            
+            // Send heartbeat
+            if let Err(e) = write_command(&mut writer_clone, &Command::Heartbeat).await {
+                error!("Failed to send heartbeat: {}", e);
+                break;
+            }
+            
+            // Collect and send system information
+            if let Ok(sys_info) = collect_system_info().await {
+                if let Err(e) = write_command(&mut writer_clone, &Command::SystemInfo { 
+                    cpu_usage: sys_info.cpu_usage,
+                    memory_usage: sys_info.memory_usage,
+                    disk_usage: sys_info.disk_usage,
+                }).await {
+                    error!("Failed to send system info: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+    
     // Main loop to listen for commands from the server
     loop {
         match read_command(&mut reader).await {
@@ -167,11 +206,183 @@ async fn create_proxy_connection(args: Args, proxy_conn_id: String) -> Result<()
     info!("('{}') Sent new proxy connection notification.", proxy_conn_id);
 
     let local_stream = TcpStream::connect(format!("{}:{}", args.local_addr, args.local_port)).await?;
-    info!("('{}') Connected to local service at {}:{}.", proxy_conn_id, args.local_addr, args.local_port);
+    info!("('{}') Connected to local service at {}:{}", proxy_conn_id, args.local_addr, args.local_port);
 
     info!("('{}') Joining streams...", proxy_conn_id);
     join_streams(proxy_stream, local_stream).await?;
     info!("('{}') Streams joined and finished.", proxy_conn_id);
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn collect_system_info() -> Result<SystemInfo> {
+    use std::process::Command;
+    
+    // Get CPU usage
+    let cpu_output = Command::new("top")
+        .args(["-bn1"])
+        .output()?;
+    let cpu_str = String::from_utf8(cpu_output.stdout)?;
+    let mut cpu_usage = 0.0;
+    for line in cpu_str.lines() {
+        if line.contains("Cpu(s)") {
+            if let Some(cpu_part) = line.split(',').next() {
+                if let Some(usage_str) = cpu_part.split_whitespace().last() {
+                    if let Ok(usage) = usage_str.trim_end_matches('%').parse::<f32>() {
+                        cpu_usage = 100.0 - usage; // Idle to usage
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    
+    // Get memory usage
+    let mem_output = Command::new("free")
+        .args(["-m"])
+        .output()?;
+    let mem_str = String::from_utf8(mem_output.stdout)?;
+    let mut memory_usage = 0.0;
+    for line in mem_str.lines() {
+        if line.starts_with("Mem:") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 {
+                if let (Ok(total), Ok(used)) = (parts[1].parse::<f32>(), parts[2].parse::<f32>()) {
+                    memory_usage = (used / total) * 100.0;
+                    break;
+                }
+            }
+        }
+    }
+    
+    // Get disk usage
+    let disk_output = Command::new("df")
+        .args(["/"])
+        .output()?;
+    let disk_str = String::from_utf8(disk_output.stdout)?;
+    let mut disk_usage = 0.0;
+    for line in disk_str.lines().skip(1) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 5 {
+            if let Ok(usage) = parts[4].trim_end_matches('%').parse::<f32>() {
+                disk_usage = usage;
+                break;
+            }
+        }
+    }
+    
+    Ok(SystemInfo {
+        cpu_usage,
+        memory_usage,
+        disk_usage,
+    })
+}
+
+#[cfg(target_os = "macos")]
+async fn collect_system_info() -> Result<SystemInfo> {
+    use std::process::Command;
+    
+    // Get CPU usage
+    let cpu_output = Command::new("top")
+        .args(["-l", "1", "-n", "0"])
+        .output()?;
+    let cpu_str = String::from_utf8(cpu_output.stdout)?;
+    let mut cpu_usage = 0.0;
+    for line in cpu_str.lines() {
+        if line.contains("CPU usage:") {
+            if let Some(usage_str) = line.split(',').next() {
+                if let Some(usage_part) = usage_str.split_whitespace().nth(2) {
+                    if let Ok(usage) = usage_part.trim_end_matches('%').parse::<f32>() {
+                        cpu_usage = usage;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    
+    // Get memory usage
+    let mem_output = Command::new("vm_stat")
+        .output()?;
+    let mem_str = String::from_utf8(mem_output.stdout)?;
+    let mut memory_usage = 0.0;
+    let (mut pages_active, mut pages_wired, mut pages_compressed) = (0u64, 0u64, 0u64);
+    let mut pages_total = 0u64;
+    
+    for line in mem_str.lines() {
+        if line.contains("Pages active:") {
+            if let Some(pages_str) = line.split_whitespace().nth(2) {
+                if let Ok(pages) = pages_str.trim_end_matches('.').parse::<u64>() {
+                    pages_active = pages;
+                }
+            }
+        } else if line.contains("Pages wired down:") {
+            if let Some(pages_str) = line.split_whitespace().nth(3) {
+                if let Ok(pages) = pages_str.trim_end_matches('.').parse::<u64>() {
+                    pages_wired = pages;
+                }
+            }
+        } else if line.contains("Pages occupied by compressor:") {
+            if let Some(pages_str) = line.split_whitespace().nth(4) {
+                if let Ok(pages) = pages_str.trim_end_matches('.').parse::<u64>() {
+                    pages_compressed = pages;
+                }
+            }
+        } else if line.contains("Mach Virtual Memory Statistics") {
+            if let Some(pages_str) = line.split_whitespace().nth(5) {
+                if let Ok(pages) = pages_str.parse::<u64>() {
+                    pages_total = pages;
+                }
+            }
+        }
+    }
+    
+    if pages_total > 0 {
+        let used_pages = pages_active + pages_wired + pages_compressed;
+        memory_usage = (used_pages as f32 / pages_total as f32) * 100.0;
+    }
+    
+    // Get disk usage
+    let disk_output = Command::new("df")
+        .args(["-P", "/"])
+        .output()?;
+    let disk_str = String::from_utf8(disk_output.stdout)?;
+    let mut disk_usage = 0.0;
+    for line in disk_str.lines().skip(1) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 5 {
+            if let Ok(usage) = parts[4].trim_end_matches('%').parse::<f32>() {
+                disk_usage = usage;
+                break;
+            }
+        }
+    }
+    
+    Ok(SystemInfo {
+        cpu_usage,
+        memory_usage,
+        disk_usage,
+    })
+}
+
+#[cfg(target_os = "windows")]
+async fn collect_system_info() -> Result<SystemInfo> {
+    // For Windows, we'll return default values as implementing this properly
+    // would require additional dependencies
+    Ok(SystemInfo {
+        cpu_usage: 0.0,
+        memory_usage: 0.0,
+        disk_usage: 0.0,
+    })
+}
+
+// Fallback for other platforms
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+async fn collect_system_info() -> Result<SystemInfo> {
+    Ok(SystemInfo {
+        cpu_usage: 0.0,
+        memory_usage: 0.0,
+        disk_usage: 0.0,
+    })
 }

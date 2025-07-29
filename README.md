@@ -13,6 +13,8 @@ This project consists of two main components:
 - **Random Load Balancing**: The server randomly selects one of the available clients to handle each incoming public request, distributing the load evenly.
 - **Simple Protocol**: Communication between the server and clients is handled via a straightforward JSON-based command protocol over TCP.
 - **Authentication**: Clients must authenticate with the server using email/password or a token before registering.
+- **Heartbeat Monitoring**: Clients periodically send heartbeat signals to the server to indicate they are still active.
+- **System Information Reporting**: Clients periodically report system metrics (CPU, memory, and disk usage) to the server.
 
 ## Architecture
 
@@ -96,6 +98,16 @@ curl http://localhost:8080
 ```
 
 Observe the logs in the `frps_demo` terminal. You will see messages like `Chose client 'client_A' for the new connection.` or `Chose client 'client_B' for the new connection.`, demonstrating the random distribution of requests.
+
+### 6. Monitor Client System Information
+
+To view the system information reported by clients, use the `--monitor` flag with the server:
+
+```bash
+cargo run --release --bin frps_demo -- --monitor
+```
+
+This will display a table with the latest system metrics reported by each active client.
 
 ## Client Configuration
 

@@ -21,11 +21,24 @@ struct Args {
 
     #[arg(long, default_value_t = 18080)]
     public_port: u16,
+    
+    /// Print client monitoring data
+    #[arg(long)]
+    monitor: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SystemInfo {
+    cpu_usage: f32,
+    memory_usage: f32,
+    disk_usage: f32,
+    last_heartbeat: std::time::SystemTime,
 }
 
 struct ClientInfo {
     writer: Arc<Mutex<OwnedWriteHalf>>,
     authed: bool,
+    system_info: Option<SystemInfo>,
 }
 
 struct User {
@@ -55,6 +68,12 @@ async fn main() -> Result<()> {
 
     info!("FRPS listening on ports: Control={}, Proxy={}, Public={}", args.control_port, args.proxy_port, args.public_port);
 
+    // If monitor flag is set, just print monitoring data and exit
+    if args.monitor {
+        print_monitoring_data(active_clients.clone()).await;
+        return Ok(());
+    }
+    
     let server_logic = tokio::select! {
         res = handle_control_connections(control_listener, active_clients.clone(), user_db, token_db) => res,
         res = handle_proxy_connections(proxy_listener, pending_connections.clone()) => res,
@@ -132,7 +151,11 @@ async fn handle_single_client(stream: TcpStream, active_clients: ActiveClients, 
             return Err(anyhow!("Client ID already registered"));
         }
 
-        clients.insert(id.clone(), ClientInfo { writer: writer.clone(), authed });
+        clients.insert(id.clone(), ClientInfo { 
+            writer: writer.clone(), 
+            authed,
+            system_info: None,
+        });
         let _ = write_command(&mut *writer.lock().await, &Command::RegisterResult { success: true, error: None }).await;
         info!("Client {} registered successfully.", id);
         id
@@ -146,6 +169,37 @@ async fn handle_single_client(stream: TcpStream, active_clients: ActiveClients, 
 async fn client_loop(reader: &mut OwnedReadHalf, client_id: String, active_clients: ActiveClients) -> Result<()> {
     loop {
         match read_command(reader).await {
+            Ok(Command::Heartbeat) => {
+                info!("Received heartbeat from client {}", client_id);
+                // Update last heartbeat time
+                let mut clients = active_clients.lock().await;
+                if let Some(client_info) = clients.get_mut(&client_id) {
+                    if let Some(ref mut sys_info) = client_info.system_info {
+                        sys_info.last_heartbeat = std::time::SystemTime::now();
+                    } else {
+                        client_info.system_info = Some(SystemInfo {
+                            cpu_usage: 0.0,
+                            memory_usage: 0.0,
+                            disk_usage: 0.0,
+                            last_heartbeat: std::time::SystemTime::now(),
+                        });
+                    }
+                }
+            }
+            Ok(Command::SystemInfo { cpu_usage, memory_usage, disk_usage }) => {
+                info!("Received system info from client {}: CPU: {:.2}%, Memory: {:.2}%, Disk: {:.2}%", 
+                      client_id, cpu_usage, memory_usage, disk_usage);
+                // Update system info
+                let mut clients = active_clients.lock().await;
+                if let Some(client_info) = clients.get_mut(&client_id) {
+                    client_info.system_info = Some(SystemInfo {
+                        cpu_usage,
+                        memory_usage,
+                        disk_usage,
+                        last_heartbeat: std::time::SystemTime::now(),
+                    });
+                }
+            }
             Ok(cmd) => {
                 warn!("Received unexpected command: {:?}", cmd);
             }
@@ -238,4 +292,36 @@ async fn route_public_connection(user_stream: TcpStream, active_clients: ActiveC
     }
 
     Ok(())
+}
+
+async fn print_monitoring_data(active_clients: ActiveClients) {
+    let clients = active_clients.lock().await;
+    if clients.is_empty() {
+        println!("No active clients.");
+        return;
+    }
+    
+    println!("Client Monitoring Data:");
+    println!("{:<20} {:<10} {:<10} {:<10} {:<20}", "Client ID", "CPU (%)", "Memory (%)", "Disk (%)", "Last Heartbeat");
+    println!("{}", "-".repeat(80));
+    
+    for (client_id, client_info) in clients.iter() {
+        if let Some(sys_info) = &client_info.system_info {
+            let duration = sys_info.last_heartbeat.elapsed().unwrap_or(std::time::Duration::from_secs(0));
+            let seconds = duration.as_secs();
+            println!("{:<20} {:<10.2} {:<10.2} {:<10.2} {:<20}", 
+                     client_id, 
+                     sys_info.cpu_usage, 
+                     sys_info.memory_usage, 
+                     sys_info.disk_usage,
+                     format!("{}s ago", seconds));
+        } else {
+            println!("{:<20} {:<10} {:<10} {:<10} {:<20}", 
+                     client_id, 
+                     "N/A", 
+                     "N/A", 
+                     "N/A",
+                     "No data");
+        }
+    }
 }
