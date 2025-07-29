@@ -1,12 +1,22 @@
 use anyhow::{anyhow, Result};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::Json,
+    routing::{delete, get, post},
+    Router,
+};
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use common::{read_command, write_command, join_streams, Command};
 use rand::seq::SliceRandom;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::net::tcp::{OwnedWriteHalf, OwnedReadHalf};
+use tower_http::cors::CorsLayer;
 use tracing::{info, warn, error, Level};
 use uuid::Uuid;
 
@@ -22,12 +32,15 @@ struct Args {
     #[arg(long, default_value_t = 18080)]
     public_port: u16,
     
+    #[arg(long, default_value_t = 18081)]
+    api_port: u16,
+    
     /// Print client monitoring data
     #[arg(long)]
     monitor: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 struct SystemInfo {
     cpu_usage: f32,
     memory_usage: f32,
@@ -35,20 +48,436 @@ struct SystemInfo {
     last_heartbeat: std::time::SystemTime,
 }
 
+// API Response structures
+#[derive(Serialize)]
+struct ApiResponse<T> {
+    success: bool,
+    data: Option<T>,
+    message: String,
+    timestamp: DateTime<Utc>,
+}
+
+impl<T> ApiResponse<T> {
+    fn success(data: T) -> Self {
+        Self {
+            success: true,
+            data: Some(data),
+            message: "操作成功".to_string(),
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn error(message: String) -> ApiResponse<()> {
+        ApiResponse {
+            success: false,
+            data: None,
+            message,
+            timestamp: Utc::now(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ClientInfoResponse {
+    client_id: String,
+    authed: bool,
+    system_info: Option<SystemInfoResponse>,
+    connected_at: DateTime<Utc>,
+}
+
+#[derive(Serialize)]
+struct SystemInfoResponse {
+    cpu_usage: f32,
+    memory_usage: f32,
+    disk_usage: f32,
+    last_heartbeat: DateTime<Utc>,
+    heartbeat_seconds_ago: u64,
+}
+
+#[derive(Serialize)]
+struct ServerStats {
+    active_clients: usize,
+    pending_connections: usize,
+    total_connections: u64,
+    uptime_seconds: u64,
+}
+
+#[derive(Serialize, Clone)]
+struct ServerConfig {
+    control_port: u16,
+    proxy_port: u16,
+    public_port: u16,
+    api_port: u16,
+}
+
+#[derive(Serialize)]
+struct HealthStatus {
+    status: String,
+    timestamp: DateTime<Utc>,
+    uptime_seconds: u64,
+}
+
 struct ClientInfo {
     writer: Arc<Mutex<OwnedWriteHalf>>,
     authed: bool,
     system_info: Option<SystemInfo>,
+    connected_at: DateTime<Utc>,
 }
 
 struct User {
     pass: String,
 }
 
+// Application State for API
+#[derive(Clone)]
+struct AppState {
+    active_clients: ActiveClients,
+    pending_connections: PendingConnections,
+    user_db: UserDb,
+    token_db: TokenDb,
+    server_start_time: DateTime<Utc>,
+    total_connections: Arc<Mutex<u64>>,
+    config: ServerConfig,
+}
+
 type UserDb = Arc<Mutex<HashMap<String, User>>>;
 type TokenDb = Arc<Mutex<HashMap<String, String>>>;
 type ActiveClients = Arc<Mutex<HashMap<String, ClientInfo>>>;
 type PendingConnections = Arc<Mutex<HashMap<String, TcpStream>>>;
+
+// API Handlers
+
+// Client Query APIs
+async fn get_all_clients(State(app_state): State<AppState>) -> Result<Json<ApiResponse<Vec<ClientInfoResponse>>>, StatusCode> {
+    let clients = app_state.active_clients.lock().await;
+    let mut client_responses = Vec::new();
+    
+    for (client_id, client_info) in clients.iter() {
+        let system_info_response = client_info.system_info.as_ref().map(|sys_info| {
+            let heartbeat_duration = sys_info.last_heartbeat.elapsed().unwrap_or(std::time::Duration::from_secs(0));
+            SystemInfoResponse {
+                cpu_usage: sys_info.cpu_usage,
+                memory_usage: sys_info.memory_usage,
+                disk_usage: sys_info.disk_usage,
+                last_heartbeat: DateTime::from_timestamp(
+                    sys_info.last_heartbeat.duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or(std::time::Duration::from_secs(0)).as_secs() as i64, 0
+                ).unwrap_or(Utc::now()),
+                heartbeat_seconds_ago: heartbeat_duration.as_secs(),
+            }
+        });
+        
+        client_responses.push(ClientInfoResponse {
+            client_id: client_id.clone(),
+            authed: client_info.authed,
+            system_info: system_info_response,
+            connected_at: client_info.connected_at,
+        });
+    }
+    
+    Ok(Json(ApiResponse::success(client_responses)))
+}
+
+async fn get_client_by_id(
+    Path(client_id): Path<String>,
+    State(app_state): State<AppState>
+) -> Result<Json<ApiResponse<ClientInfoResponse>>, StatusCode> {
+    let clients = app_state.active_clients.lock().await;
+    
+    if let Some(client_info) = clients.get(&client_id) {
+        let system_info_response = client_info.system_info.as_ref().map(|sys_info| {
+            let heartbeat_duration = sys_info.last_heartbeat.elapsed().unwrap_or(std::time::Duration::from_secs(0));
+            SystemInfoResponse {
+                cpu_usage: sys_info.cpu_usage,
+                memory_usage: sys_info.memory_usage,
+                disk_usage: sys_info.disk_usage,
+                last_heartbeat: DateTime::from_timestamp(
+                    sys_info.last_heartbeat.duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or(std::time::Duration::from_secs(0)).as_secs() as i64, 0
+                ).unwrap_or(Utc::now()),
+                heartbeat_seconds_ago: heartbeat_duration.as_secs(),
+            }
+        });
+        
+        let response = ClientInfoResponse {
+            client_id: client_id.clone(),
+            authed: client_info.authed,
+            system_info: system_info_response,
+            connected_at: client_info.connected_at,
+        };
+        
+        Ok(Json(ApiResponse::success(response)))
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+async fn get_client_status(
+    Path(client_id): Path<String>,
+    State(app_state): State<AppState>
+) -> Result<Json<ApiResponse<HashMap<String, serde_json::Value>>>, StatusCode> {
+    let clients = app_state.active_clients.lock().await;
+    
+    if let Some(client_info) = clients.get(&client_id) {
+        let mut status = HashMap::new();
+        status.insert("client_id".to_string(), serde_json::Value::String(client_id));
+        status.insert("connected".to_string(), serde_json::Value::Bool(true));
+        status.insert("authenticated".to_string(), serde_json::Value::Bool(client_info.authed));
+        status.insert("connected_at".to_string(), serde_json::Value::String(client_info.connected_at.to_rfc3339()));
+        
+        if let Some(sys_info) = &client_info.system_info {
+            let heartbeat_duration = sys_info.last_heartbeat.elapsed().unwrap_or(std::time::Duration::from_secs(0));
+            status.insert("last_heartbeat_seconds_ago".to_string(), serde_json::Value::Number(heartbeat_duration.as_secs().into()));
+        }
+        
+        Ok(Json(ApiResponse::success(status)))
+    } else {
+        let mut status = HashMap::new();
+        status.insert("client_id".to_string(), serde_json::Value::String(client_id));
+        status.insert("connected".to_string(), serde_json::Value::Bool(false));
+        Ok(Json(ApiResponse::success(status)))
+    }
+}
+
+// System Monitoring APIs
+async fn get_monitoring_data(State(app_state): State<AppState>) -> Result<Json<ApiResponse<Vec<SystemInfoResponse>>>, StatusCode> {
+    let clients = app_state.active_clients.lock().await;
+    let mut monitoring_data = Vec::new();
+    
+    for (_client_id, client_info) in clients.iter() {
+        if let Some(sys_info) = &client_info.system_info {
+            let heartbeat_duration = sys_info.last_heartbeat.elapsed().unwrap_or(std::time::Duration::from_secs(0));
+            monitoring_data.push(SystemInfoResponse {
+                cpu_usage: sys_info.cpu_usage,
+                memory_usage: sys_info.memory_usage,
+                disk_usage: sys_info.disk_usage,
+                last_heartbeat: DateTime::from_timestamp(
+                    sys_info.last_heartbeat.duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or(std::time::Duration::from_secs(0)).as_secs() as i64, 0
+                ).unwrap_or(Utc::now()),
+                heartbeat_seconds_ago: heartbeat_duration.as_secs(),
+            });
+        }
+    }
+    
+    Ok(Json(ApiResponse::success(monitoring_data)))
+}
+
+async fn get_client_monitoring(
+    Path(client_id): Path<String>,
+    State(app_state): State<AppState>
+) -> Result<Json<ApiResponse<SystemInfoResponse>>, StatusCode> {
+    let clients = app_state.active_clients.lock().await;
+    
+    if let Some(client_info) = clients.get(&client_id) {
+        if let Some(sys_info) = &client_info.system_info {
+            let heartbeat_duration = sys_info.last_heartbeat.elapsed().unwrap_or(std::time::Duration::from_secs(0));
+            let response = SystemInfoResponse {
+                cpu_usage: sys_info.cpu_usage,
+                memory_usage: sys_info.memory_usage,
+                disk_usage: sys_info.disk_usage,
+                last_heartbeat: DateTime::from_timestamp(
+                    sys_info.last_heartbeat.duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or(std::time::Duration::from_secs(0)).as_secs() as i64, 0
+                ).unwrap_or(Utc::now()),
+                heartbeat_seconds_ago: heartbeat_duration.as_secs(),
+            };
+            
+            Ok(Json(ApiResponse::success(response)))
+        } else {
+            Err(StatusCode::NOT_FOUND)
+        }
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+async fn get_health() -> Json<ApiResponse<HealthStatus>> {
+    let health = HealthStatus {
+        status: "healthy".to_string(),
+        timestamp: Utc::now(),
+        uptime_seconds: 0, // Will be calculated in main
+    };
+    
+    Json(ApiResponse::success(health))
+}
+
+// Client Management APIs
+async fn disconnect_client(
+    Path(client_id): Path<String>,
+    State(app_state): State<AppState>
+) -> Result<Json<ApiResponse<HashMap<String, String>>>, StatusCode> {
+    let mut clients = app_state.active_clients.lock().await;
+    
+    if clients.remove(&client_id).is_some() {
+        let mut response = HashMap::new();
+        response.insert("client_id".to_string(), client_id);
+        response.insert("action".to_string(), "disconnected".to_string());
+        Ok(Json(ApiResponse::success(response)))
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+async fn get_client_heartbeat(
+    Path(client_id): Path<String>,
+    State(app_state): State<AppState>
+) -> Result<Json<ApiResponse<HashMap<String, serde_json::Value>>>, StatusCode> {
+    let clients = app_state.active_clients.lock().await;
+    
+    if let Some(client_info) = clients.get(&client_id) {
+        let mut heartbeat_info = HashMap::new();
+        heartbeat_info.insert("client_id".to_string(), serde_json::Value::String(client_id));
+        
+        if let Some(sys_info) = &client_info.system_info {
+            let heartbeat_duration = sys_info.last_heartbeat.elapsed().unwrap_or(std::time::Duration::from_secs(0));
+            heartbeat_info.insert("last_heartbeat_seconds_ago".to_string(), serde_json::Value::Number(heartbeat_duration.as_secs().into()));
+            heartbeat_info.insert("status".to_string(), serde_json::Value::String(
+                if heartbeat_duration.as_secs() < 60 { "healthy" } else { "stale" }.to_string()
+            ));
+        } else {
+            heartbeat_info.insert("status".to_string(), serde_json::Value::String("no_data".to_string()));
+        }
+        
+        Ok(Json(ApiResponse::success(heartbeat_info)))
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+// Connection Statistics APIs
+async fn get_stats(State(app_state): State<AppState>) -> Json<ApiResponse<ServerStats>> {
+    let clients = app_state.active_clients.lock().await;
+    let pending = app_state.pending_connections.lock().await;
+    let total_connections = *app_state.total_connections.lock().await;
+    
+    let uptime_seconds = Utc::now().signed_duration_since(app_state.server_start_time).num_seconds() as u64;
+    
+    let stats = ServerStats {
+        active_clients: clients.len(),
+        pending_connections: pending.len(),
+        total_connections,
+        uptime_seconds,
+    };
+    
+    Json(ApiResponse::success(stats))
+}
+
+async fn get_connections(State(app_state): State<AppState>) -> Json<ApiResponse<HashMap<String, serde_json::Value>>> {
+    let clients = app_state.active_clients.lock().await;
+    let pending = app_state.pending_connections.lock().await;
+    
+    let mut connections = HashMap::new();
+    connections.insert("active_clients".to_string(), serde_json::Value::Number(clients.len().into()));
+    connections.insert("pending_connections".to_string(), serde_json::Value::Number(pending.len().into()));
+    
+    let mut client_list = Vec::new();
+    for client_id in clients.keys() {
+        client_list.push(serde_json::Value::String(client_id.clone()));
+    }
+    connections.insert("client_ids".to_string(), serde_json::Value::Array(client_list));
+    
+    Json(ApiResponse::success(connections))
+}
+
+async fn get_pending_connections(State(app_state): State<AppState>) -> Json<ApiResponse<HashMap<String, serde_json::Value>>> {
+    let pending = app_state.pending_connections.lock().await;
+    
+    let mut response = HashMap::new();
+    response.insert("count".to_string(), serde_json::Value::Number(pending.len().into()));
+    
+    let mut pending_list = Vec::new();
+    for conn_id in pending.keys() {
+        pending_list.push(serde_json::Value::String(conn_id.clone()));
+    }
+    response.insert("connection_ids".to_string(), serde_json::Value::Array(pending_list));
+    
+    Json(ApiResponse::success(response))
+}
+
+// Configuration Management APIs
+async fn get_config(State(app_state): State<AppState>) -> Json<ApiResponse<ServerConfig>> {
+    Json(ApiResponse::success(app_state.config))
+}
+
+async fn get_ports(State(app_state): State<AppState>) -> Json<ApiResponse<HashMap<String, u16>>> {
+    let mut ports = HashMap::new();
+    ports.insert("control_port".to_string(), app_state.config.control_port);
+    ports.insert("proxy_port".to_string(), app_state.config.proxy_port);
+    ports.insert("public_port".to_string(), app_state.config.public_port);
+    ports.insert("api_port".to_string(), app_state.config.api_port);
+    
+    Json(ApiResponse::success(ports))
+}
+
+// Authentication Management APIs
+async fn get_users(State(app_state): State<AppState>) -> Json<ApiResponse<Vec<String>>> {
+    let users = app_state.user_db.lock().await;
+    let user_list: Vec<String> = users.keys().cloned().collect();
+    
+    Json(ApiResponse::success(user_list))
+}
+
+async fn get_active_tokens(State(app_state): State<AppState>) -> Json<ApiResponse<HashMap<String, serde_json::Value>>> {
+    let tokens = app_state.token_db.lock().await;
+    
+    let mut response = HashMap::new();
+    response.insert("active_token_count".to_string(), serde_json::Value::Number(tokens.len().into()));
+    
+    let mut token_info = Vec::new();
+    for (token, email) in tokens.iter() {
+        let mut info = HashMap::new();
+        info.insert("token_prefix".to_string(), serde_json::Value::String(format!("{}...", &token[..8])));
+        info.insert("email".to_string(), serde_json::Value::String(email.clone()));
+        token_info.push(serde_json::Value::Object(info.into_iter().collect()));
+    }
+    response.insert("tokens".to_string(), serde_json::Value::Array(token_info));
+    
+    Json(ApiResponse::success(response))
+}
+
+// Create API Router
+fn create_api_router(app_state: AppState) -> Router {
+    Router::new()
+        // Client Query APIs
+        .route("/api/clients", get(get_all_clients))
+        .route("/api/clients/:client_id", get(get_client_by_id))
+        .route("/api/clients/:client_id/status", get(get_client_status))
+        
+        // System Monitoring APIs
+        .route("/api/monitoring", get(get_monitoring_data))
+        .route("/api/monitoring/:client_id", get(get_client_monitoring))
+        .route("/api/health", get(get_health))
+        
+        // Client Management APIs
+        .route("/api/clients/:client_id", delete(disconnect_client))
+        .route("/api/clients/:client_id/heartbeat", get(get_client_heartbeat))
+        
+        // Connection Statistics APIs
+        .route("/api/stats", get(get_stats))
+        .route("/api/connections", get(get_connections))
+        .route("/api/connections/pending", get(get_pending_connections))
+        
+        // Configuration Management APIs
+        .route("/api/config", get(get_config))
+        .route("/api/ports", get(get_ports))
+        
+        // Authentication Management APIs
+        .route("/api/users", get(get_users))
+        .route("/api/tokens/active", get(get_active_tokens))
+        
+        .layer(CorsLayer::permissive())
+        .with_state(app_state)
+}
+
+async fn run_api_server(app_state: AppState, port: u16) -> Result<()> {
+    let app = create_api_router(app_state);
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+    
+    info!("API server listening on port {}", port);
+    
+    axum::serve(listener, app).await.map_err(Into::into)
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -61,12 +490,31 @@ async fn main() -> Result<()> {
         ("test@example.com".to_string(), User { pass: "123456".to_string() }),
     ])));
     let token_db: TokenDb = Arc::new(Mutex::new(HashMap::new()));
+    let total_connections = Arc::new(Mutex::new(0u64));
+    let server_start_time = Utc::now();
+
+    // Create application state for API
+    let app_state = AppState {
+        active_clients: active_clients.clone(),
+        pending_connections: pending_connections.clone(),
+        user_db: user_db.clone(),
+        token_db: token_db.clone(),
+        server_start_time,
+        total_connections: total_connections.clone(),
+        config: ServerConfig {
+            control_port: args.control_port,
+            proxy_port: args.proxy_port,
+            public_port: args.public_port,
+            api_port: args.api_port,
+        },
+    };
 
     let control_listener = TcpListener::bind(format!("0.0.0.0:{}", args.control_port)).await?;
     let proxy_listener = TcpListener::bind(format!("0.0.0.0:{}", args.proxy_port)).await?;
     let public_listener = TcpListener::bind(format!("0.0.0.0:{}", args.public_port)).await?;
 
-    info!("FRPS listening on ports: Control={}, Proxy={}, Public={}", args.control_port, args.proxy_port, args.public_port);
+    info!("FRPS listening on ports: Control={}, Proxy={}, Public={}, API={}", 
+          args.control_port, args.proxy_port, args.public_port, args.api_port);
 
     // If monitor flag is set, just print monitoring data and exit
     if args.monitor {
@@ -77,7 +525,8 @@ async fn main() -> Result<()> {
     let server_logic = tokio::select! {
         res = handle_control_connections(control_listener, active_clients.clone(), user_db, token_db) => res,
         res = handle_proxy_connections(proxy_listener, pending_connections.clone()) => res,
-        res = handle_public_connections(public_listener, active_clients.clone(), pending_connections.clone()) => res,
+        res = handle_public_connections(public_listener, active_clients.clone(), pending_connections.clone(), total_connections.clone()) => res,
+        res = run_api_server(app_state, args.api_port) => res,
     };
 
     if let Err(e) = server_logic {
@@ -155,6 +604,7 @@ async fn handle_single_client(stream: TcpStream, active_clients: ActiveClients, 
             writer: writer.clone(), 
             authed,
             system_info: None,
+            connected_at: Utc::now(),
         });
         let _ = write_command(&mut *writer.lock().await, &Command::RegisterResult { success: true, error: None }).await;
         info!("Client {} registered successfully.", id);
@@ -240,14 +690,21 @@ async fn handle_proxy_connections(listener: TcpListener, pending_connections: Pe
     }
 }
 
-async fn handle_public_connections(listener: TcpListener, active_clients: ActiveClients, pending_connections: PendingConnections) -> Result<()> {
+async fn handle_public_connections(listener: TcpListener, active_clients: ActiveClients, pending_connections: PendingConnections, total_connections: Arc<Mutex<u64>>) -> Result<()> {
     loop {
         let (user_stream, addr) = listener.accept().await?;
         info!("New public connection from: {}", addr);
         let active_clients_clone = active_clients.clone();
         let pending_connections_clone = pending_connections.clone();
+        let total_connections_clone = total_connections.clone();
 
         tokio::spawn(async move {
+            // Increment total connections counter
+            {
+                let mut counter = total_connections_clone.lock().await;
+                *counter += 1;
+            }
+            
             if let Err(e) = route_public_connection(user_stream, active_clients_clone, pending_connections_clone).await {
                 error!("Failed to route public connection from {}: {}", addr, e);
             }
