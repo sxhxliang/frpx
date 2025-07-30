@@ -16,6 +16,7 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::net::tcp::{OwnedWriteHalf, OwnedReadHalf};
+use tokio::io::{AsyncWriteExt};
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn, error, Level};
 use uuid::Uuid;
@@ -38,6 +39,10 @@ struct Args {
     /// Print client monitoring data
     #[arg(long)]
     monitor: bool,
+    
+    /// API key for authentication
+    #[arg(long, default_value = "abc123")]
+    api_key: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -63,6 +68,15 @@ impl<T> ApiResponse<T> {
             success: true,
             data: Some(data),
             message: "操作成功".to_string(),
+            timestamp: Utc::now(),
+        }
+    }
+    
+    fn error(message: String) -> ApiResponse<()> {
+        ApiResponse {
+            success: false,
+            data: None,
+            message,
             timestamp: Utc::now(),
         }
     }
@@ -554,7 +568,7 @@ async fn main() -> Result<()> {
     let server_logic = tokio::select! {
         res = handle_control_connections(control_listener, active_clients.clone(), user_db, token_db) => res,
         res = handle_proxy_connections(proxy_listener, pending_connections.clone()) => res,
-        res = handle_public_connections(public_listener, active_clients.clone(), pending_connections.clone(), total_connections.clone()) => res,
+        res = handle_public_connections(public_listener, active_clients.clone(), pending_connections.clone(), total_connections.clone(), args.api_key.clone()) => res,
         res = run_api_server(app_state, args.api_port) => res,
     };
 
@@ -721,13 +735,14 @@ async fn handle_proxy_connections(listener: TcpListener, pending_connections: Pe
     }
 }
 
-async fn handle_public_connections(listener: TcpListener, active_clients: ActiveClients, pending_connections: PendingConnections, total_connections: Arc<Mutex<u64>>) -> Result<()> {
+async fn handle_public_connections(listener: TcpListener, active_clients: ActiveClients, pending_connections: PendingConnections, total_connections: Arc<Mutex<u64>>, api_key: String) -> Result<()> {
     loop {
         let (user_stream, addr) = listener.accept().await?;
         info!("New public connection from: {}", addr);
         let active_clients_clone = active_clients.clone();
         let pending_connections_clone = pending_connections.clone();
         let total_connections_clone = total_connections.clone();
+        let api_key = api_key.clone();
 
         tokio::spawn(async move {
             // Increment total connections counter
@@ -736,11 +751,33 @@ async fn handle_public_connections(listener: TcpListener, active_clients: Active
                 *counter += 1;
             }
             
-            if let Err(e) = route_public_connection(user_stream, active_clients_clone, pending_connections_clone).await {
+            if let Err(e) = route_public_connection(user_stream, active_clients_clone, pending_connections_clone, api_key.clone()).await {
                 error!("Failed to route public connection from {}: {}", addr, e);
             }
         });
     }
+}
+
+async fn send_http_error_response(mut stream: TcpStream, status_code: u16, error_message: &str) -> Result<()> {
+    let error_response = ApiResponse::<()>::error(error_message.to_string());
+    let json_body = serde_json::to_string(&error_response)?;
+    
+    let status_text = match status_code {
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        500 => "Internal Server Error",
+        _ => "Error",
+    };
+    
+    let response = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status_code, status_text, json_body.len(), json_body
+    );
+    
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await?;
+    Ok(())
 }
 
 async fn find_client_by_model(model_name: &str, clients: &mut HashMap<String, ClientInfo>) -> Option<String> {
@@ -754,7 +791,7 @@ async fn find_client_by_model(model_name: &str, clients: &mut HashMap<String, Cl
     None
 }
 
-async fn route_public_connection(user_stream: TcpStream, active_clients: ActiveClients, pending_connections: PendingConnections) -> Result<()> {
+async fn route_public_connection(user_stream: TcpStream, active_clients: ActiveClients, pending_connections: PendingConnections, api_key: String) -> Result<()> {
     let mut buffer = [0; 4096];
     let n = user_stream.peek(&mut buffer).await?;
     let initial_data = &buffer[..n];
@@ -763,6 +800,34 @@ async fn route_public_connection(user_stream: TcpStream, active_clients: ActiveC
     let mut req = httparse::Request::new(&mut headers);
 
     let chosen_client_id = if let Ok(httparse::Status::Complete(parsed_len)) = req.parse(initial_data) {
+        // Validate API key from Authorization header
+        let auth_header = req.headers.iter()
+            .find(|h| h.name.to_lowercase() == "authorization")
+            .and_then(|h| std::str::from_utf8(h.value).ok());
+        
+        if let Some(auth_value) = auth_header {
+            // Support both "Bearer <token>" and plain token formats
+            let provided_key = if auth_value.to_lowercase().starts_with("bearer ") {
+                &auth_value[7..] // Remove "Bearer " prefix
+            } else {
+                auth_value
+            };
+            
+            if provided_key != api_key {
+                warn!("Invalid API key provided in Authorization header");
+                if let Err(e) = send_http_error_response(user_stream, 401, "Invalid API key").await {
+                    error!("Failed to send error response: {}", e);
+                }
+                return Ok(());
+            }
+        } else {
+            warn!("No Authorization header found");
+            if let Err(e) = send_http_error_response(user_stream, 401, "Missing API key in Authorization header").await {
+                error!("Failed to send error response: {}", e);
+            }
+            return Ok(());
+        }
+        
         let mut clients = active_clients.lock().await;
         if req.method == Some("POST") && req.path == Some("/v1/chat/completions") {
             let body_offset = parsed_len;
@@ -794,17 +859,26 @@ async fn route_public_connection(user_stream: TcpStream, active_clients: ActiveC
         }
     } else {
         // Not a complete HTTP request in the first packet, or not HTTP at all.
-        None
+        // For security, we require proper HTTP requests with API key validation
+        warn!("Received non-HTTP or incomplete HTTP request");
+        if let Err(e) = send_http_error_response(user_stream, 400, "Invalid HTTP request format").await {
+            error!("Failed to send error response: {}", e);
+        }
+        return Ok(());
     };
 
     let mut clients = active_clients.lock().await;
     let chosen_client_id = if let Some(id) = chosen_client_id {
         id
     } else {
+        // This should only happen for non-chat completion requests that passed API key validation
         let client_ids: Vec<String> = clients.keys().cloned().collect();
         if client_ids.is_empty() {
             warn!("No active clients available to handle new public connection.");
-            return Err(anyhow!("No active clients"));
+            if let Err(e) = send_http_error_response(user_stream, 503, "No active clients available").await {
+                error!("Failed to send error response: {}", e);
+            }
+            return Ok(());
         }
         client_ids.choose(&mut rand::thread_rng()).ok_or_else(|| anyhow!("Failed to choose a client"))?.clone()
     };
