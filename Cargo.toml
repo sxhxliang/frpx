@@ -1,7 +1,7 @@
 [workspace]
 members = [
-    "frps_demo",
-    "frpc_demo",
+    "frps",
+    "frpc",
     "common",
 ]
 resolver = "2"

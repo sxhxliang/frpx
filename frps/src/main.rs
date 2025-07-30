@@ -13,7 +13,6 @@ use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use httparse;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::net::tcp::{OwnedWriteHalf, OwnedReadHalf};
@@ -502,7 +501,7 @@ fn create_api_router(app_state: AppState) -> Router {
 
 async fn run_api_server(app_state: AppState, port: u16) -> Result<()> {
     let app = create_api_router(app_state);
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
     
     info!("API server listening on port {}", port);
     
@@ -774,7 +773,7 @@ async fn route_public_connection(user_stream: TcpStream, active_clients: ActiveC
             // A more robust solution would involve a proper body reading loop.
             if let Ok(body_str) = std::str::from_utf8(body_bytes) {
                  if let Ok(chat_req) = serde_json::from_str::<ChatCompletionRequest>(body_str) {
-                    if let Some(client_id) = find_client_by_model(&chat_req.model, &mut *clients).await {
+                    if let Some(client_id) = find_client_by_model(&chat_req.model, &mut clients).await {
                         info!("Found client '{}' for model '{}'", client_id, chat_req.model);
                         Some(client_id)
                     } else {
@@ -828,7 +827,7 @@ async fn route_public_connection(user_stream: TcpStream, active_clients: ActiveC
             drop(writer);
             clients.remove(&chosen_client_id);
             pending_connections.lock().await.remove(&proxy_conn_id);
-            return Err(e.into());
+            return Err(e);
         }
         info!("Successfully sent RequestNewProxyConn to client {}", chosen_client_id);
     } else {

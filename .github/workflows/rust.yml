@@ -17,8 +17,8 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Build-Server
-      run: cargo build --bin frps_demo --verbose
+      run: cargo build --bin frps --verbose
     - name: Build-Client
-      run: cargo build --bin frpc_demo --verbose 
+      run: cargo build --bin frpc --verbose 
     - name: Run tests
       run: cargo test --verbose

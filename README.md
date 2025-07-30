@@ -3,13 +3,13 @@
 `frpx` is a simple reverse proxy tool, inspired by `frp`, designed to expose local network services to the internet. Its key feature is a built-in random load balancing strategy, allowing for high availability and horizontal scaling of backend services.
 
 This project consists of two main components:
-- `frps_demo`: The server application that runs on a publicly accessible machine.
-- `frpc_demo`: The client application that runs on the machine with the local service you want to expose.
+- `frps`: The server application that runs on a publicly accessible machine.
+- `frpc`: The client application that runs on the machine with the local service you want to expose.
 
 ## Features
 
 - **High Availability**: If a client instance or its local service goes down, the server automatically removes it from the pool of active clients, ensuring new requests are routed only to healthy instances.
-- **Horizontal Scaling**: To handle increased load, you can simply run more `frpc_demo` instances. They will automatically register with the server and be included in the load balancing pool.
+- **Horizontal Scaling**: To handle increased load, you can simply run more `frpc` instances. They will automatically register with the server and be included in the load balancing pool.
 - **Random Load Balancing**: The server randomly selects one of the available clients to handle each incoming public request, distributing the load evenly.
 - **Simple Protocol**: Communication between the server and clients is handled via a straightforward JSON-based command protocol over TCP.
 - **Authentication**: Clients must authenticate with the server using email/password or a token before registering.
@@ -85,18 +85,18 @@ The compiled binaries will be located in the `target/release/` directory.
 
 ### 2. Run a Local Service
 
-For testing, you need a service running on the port that `frpc_demo` will connect to (default is `11434`). You can use the built-in Python web server for this. Open a terminal and run:
+For testing, you need a service running on the port that `frpc` will connect to (default is `11434`). You can use the built-in Python web server for this. Open a terminal and run:
 
 ```bash
 python3 -m http.server 11434
 ```
 
-### 3. Start the Server (`frps_demo`)
+### 3. Start the Server (`frps`)
 
-In a new terminal, start the `frps_demo` server:
+In a new terminal, start the `frps` server:
 
 ```bash
-cargo run --release --bin frps_demo
+cargo run --release --bin frps
 ```
 
 You should see a log message indicating that the server is listening on all four ports (Control, Proxy, Public, and API).
@@ -105,7 +105,7 @@ When starting the server for the first time, you'll need to authenticate with cr
 - Email: `test@example.com`
 - Password: `123456`
 
-### 4. Start Multiple Clients (`frpc_demo`)
+### 4. Start Multiple Clients (`frpc`)
 
 To see the load balancing in action, you need to start at least two client instances. Each client **must have a unique `--client-id`**.
 
@@ -117,12 +117,12 @@ After successful authentication, a token will be saved to `token.json` for futur
 
 **Terminal 1 - Client A:**
 ```bash
-cargo run --release --bin frpc_demo -- --client-id client_A
+cargo run --release --bin frpc -- --client-id client_A
 ```
 
 **Terminal 2 - Client B:**
 ```bash
-cargo run --release --bin frpc_demo -- --client-id client_B
+cargo run --release --bin frpc -- --client-id client_B
 ```
 
 Check the server logs to confirm that both clients have successfully registered.
@@ -139,7 +139,7 @@ curl http://localhost:18080
 curl http://localhost:18080
 ```
 
-Observe the logs in the `frps_demo` terminal. You will see messages like `Chose client 'client_A' for the new connection.` or `Chose client 'client_B' for the new connection.`, demonstrating the random distribution of requests.
+Observe the logs in the `frps` terminal. You will see messages like `Chose client 'client_A' for the new connection.` or `Chose client 'client_B' for the new connection.`, demonstrating the random distribution of requests.
 
 ### 6. Monitor Client System Information
 
@@ -147,7 +147,7 @@ Observe the logs in the `frps_demo` terminal. You will see messages like `Chose 
 To view the system information reported by clients, use the `--monitor` flag with the server:
 
 ```bash
-cargo run --release --bin frps_demo -- --monitor
+cargo run --release --bin frps -- --monitor
 ```
 
 This will display a table with the latest system metrics reported by each active client.
@@ -171,10 +171,10 @@ curl http://localhost:18081/api/health
 
 ## Server Configuration
 
-The `frps_demo` server can be configured via command-line arguments:
+The `frps` server can be configured via command-line arguments:
 
 ```
-Usage: frps_demo [OPTIONS]
+Usage: frps [OPTIONS]
 
 Options:
       --control-port <CONTROL_PORT>
@@ -199,10 +199,10 @@ Options:
 
 ## Client Configuration
 
-The `frpc_demo` client can be configured via command-line arguments:
+The `frpc` client can be configured via command-line arguments:
 
 ```
-Usage: frpc_demo [OPTIONS] --client-id <CLIENT_ID>
+Usage: frpc [OPTIONS] --client-id <CLIENT_ID>
 
 Options:
   -c, --client-id <CLIENT_ID>

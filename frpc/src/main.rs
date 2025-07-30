@@ -225,7 +225,7 @@ async fn main() -> Result<()> {
             Ok(cmd) => {
                 warn!("Received unexpected command: {:?}", cmd);
             }
-            Err(ref e) if e.downcast_ref::<io::Error>().map_or(false, |io_err| io_err.kind() == io::ErrorKind::UnexpectedEof) => {
+            Err(ref e) if e.downcast_ref::<io::Error>().is_some_and(|io_err| io_err.kind() == io::ErrorKind::UnexpectedEof) => {
                 error!("Control connection closed by server. Shutting down.");
                 break;
             }

@@ -5,7 +5,7 @@
   1. 核心需求：带随机负载均衡的 frp
 
    * 原始需求: 实现一个类似 frp 的工具，核心是支持随机负载均衡策略。
-   * 代码实现: 在 frps_demo/src/main.rs 的 route_public_connection 函数中，我们明确地实现了这一逻辑：
+   * 代码实现: 在 frps/src/main.rs 的 route_public_connection 函数中，我们明确地实现了这一逻辑：
 
     1     // 1. 获取所有活跃客户端的 ID
     2     let client_ids: Vec<String> = clients.keys().cloned().collect();
@@ -22,7 +22,7 @@
   2. 高可用性
 
    * 原始需求: 如果一个 frpc 实例或其服务宕机，frps 会自动将其从活跃列表中移除。
-   * 代码实现: 在 frps_demo/src/main.rs 的 handle_single_client 函数中，有一个专门的循环来检测客户端控制连接的断开：
+   * 代码实现: 在 frps/src/main.rs 的 handle_single_client 函数中，有一个专门的循环来检测客户端控制连接的断开：
 
    1     loop {
    2         // read_u8() 会在连接关闭时返回一个错误 (如 UnexpectedEof)
@@ -40,25 +40,25 @@
 
    * 原始需求: 启动更多的 frpc 实例，它们会自动注册到 frps 并加入负载均衡池。
    * 代码实现:
-       * frps_demo 的 handle_control_connections 函数在一个循环中不断 accept() 新的客户端连接，并为每个连接生成一个独立的 handle_single_client 任务。
-       * frpc_demo 启动时需要一个唯一的 client_id，这保证了它们在服务端的 HashMap 中可以被独立管理。
+       * frps 的 handle_control_connections 函数在一个循环中不断 accept() 新的客户端连接，并为每个连接生成一个独立的 handle_single_client 任务。
+       * frpc 启动时需要一个唯一的 client_id，这保证了它们在服务端的 HashMap 中可以被独立管理。
    * 一致性: 完全一致。服务端的设计允许任意数量的客户端连接和注册，每个成功注册的客户端都会被添加到 active_clients 中，从而自动进入负载均衡池。
 
   4. 架构和端口定义
 
    * 原始需求:
-       * frps_demo: 控制端口 7000, 代理端口 7001, 公共端口 8080。
-       * frpc_demo: 每个实例有唯一的 client_id。
+       * frps: 控制端口 7000, 代理端口 7001, 公共端口 8080。
+       * frpc: 每个实例有唯一的 client_id。
    * 代码实现:
-       * frps_demo/src/main.rs: const CONTROL_PORT: u16 = 7000;, PROXY_PORT: u16 = 7001;, PUBLIC_PORT: u16 = 8080;。
-       * frpc_demo/src/main.rs: 使用 clap 库强制要求通过命令行参数 --client-id 提供一个唯一的 ID。
+       * frps/src/main.rs: const CONTROL_PORT: u16 = 7000;, PROXY_PORT: u16 = 7001;, PUBLIC_PORT: u16 = 8080;。
+       * frpc/src/main.rs: 使用 clap 库强制要求通过命令行参数 --client-id 提供一个唯一的 ID。
    * 一致性: 完全一致。
 
   5. 核心状态管理 (frps)
 
    * 原始需求: 使用线程安全的哈希表 Arc<Mutex<HashMap<String, ClientInfo>>> 来管理活跃客户端，ClientInfo 包含控制连接的写入流。
    * 代码实现:
-       * frps_demo/src/main.rs:
+       * frps/src/main.rs:
 
    1         struct ClientInfo {
    2             writer: Arc<Mutex<OwnedWriteHalf>>,
@@ -70,18 +70,18 @@
   6. 详细工作流程
 
    * 注册阶段:
-       1. frpc 连接 frps:7000 并发送 Register 命令。 (✓ frpc_demo/src/main.rs)
-       2. frps 接收 Register，检查 client_id 唯一性，存入 active_clients，并返回 RegisterResult。 (✓ frps_demo/src/main.rs)
+       1. frpc 连接 frps:7000 并发送 Register 命令。 (✓ frpc/src/main.rs)
+       2. frps 接收 Register，检查 client_id 唯一性，存入 active_clients，并返回 RegisterResult。 (✓ frps/src/main.rs)
 
    * 请求转发阶段:
-       1. 用户连接 frps:8080。 (✓ frps_demo 的 handle_public_connections)
-       2. frps 随机选择一个 client_id。 (✓ frps_demo 的 route_public_connection)
-       3. frps 生成 proxy_conn_id，将用户连接存入 pending_connections。 (✓ frps_demo 的 route_public_connection)
-       4. frps 向被选中的 frpc 发送 RequestNewProxyConn 指令。 (✓ frps_demo 的 route_public_connection)
-       5. 被选中的 frpc 收到指令，连接 frps:7001，并发送 NewProxyConn 指令（包含了 proxy_conn_id）。 (✓ frpc_demo 的 create_proxy_connection)
-       6. frpc 连接本地服务 localhost:3000。 (✓ frpc_demo 的 create_proxy_connection)
-       7. frps 在 7001 端口收到 NewProxyConn，通过 proxy_conn_id 从 pending_connections 中找到用户连接，完成配对。 (✓ frps_demo 的 handle_proxy_connections)
-       8. frps 和 frpc 分别在配对好的流之间转发数据 (join_streams)。 (✓ frps_demo 和 frpc_demo)
+       1. 用户连接 frps:8080。 (✓ frps 的 handle_public_connections)
+       2. frps 随机选择一个 client_id。 (✓ frps 的 route_public_connection)
+       3. frps 生成 proxy_conn_id，将用户连接存入 pending_connections。 (✓ frps 的 route_public_connection)
+       4. frps 向被选中的 frpc 发送 RequestNewProxyConn 指令。 (✓ frps 的 route_public_connection)
+       5. 被选中的 frpc 收到指令，连接 frps:7001，并发送 NewProxyConn 指令（包含了 proxy_conn_id）。 (✓ frpc 的 create_proxy_connection)
+       6. frpc 连接本地服务 localhost:3000。 (✓ frpc 的 create_proxy_connection)
+       7. frps 在 7001 端口收到 NewProxyConn，通过 proxy_conn_id 从 pending_connections 中找到用户连接，完成配对。 (✓ frps 的 handle_proxy_connections)
+       8. frps 和 frpc 分别在配对好的流之间转发数据 (join_streams)。 (✓ frps 和 frpc)
 
    * 一致性: 完全一致。代码的执行逻辑严格遵循了您在需求中描述的每一个步骤。
 

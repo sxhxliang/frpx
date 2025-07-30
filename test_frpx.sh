@@ -67,8 +67,8 @@ wait_for_log() {
 
 # --- Pre-Test Cleanup ---
 echo "[INFO] Performing pre-test cleanup..."
-pkill -f "target/release/frps_demo" &> /dev/null
-pkill -f "target/release/frpc_demo" &> /dev/null
+pkill -f "target/release/frps" &> /dev/null
+pkill -f "target/release/frpc" &> /dev/null
 pkill -f "python3 -m http.server" &> /dev/null
 rm -f token.json  # Remove any existing token file
 sleep 1
@@ -91,19 +91,19 @@ python3 -m http.server ${TEST_LOCAL_PORT} &> $HTTP_SERVER_LOG &
 HTTP_PID=$!
 echo "- Local HTTP server started (PID: $HTTP_PID)"
 
-./target/release/frps_demo --control-port ${TEST_CONTROL_PORT} --proxy-port ${TEST_PROXY_PORT} --public-port ${TEST_PUBLIC_PORT} &> $FRPS_LOG &
+./target/release/frps --control-port ${TEST_CONTROL_PORT} --proxy-port ${TEST_PROXY_PORT} --public-port ${TEST_PUBLIC_PORT} &> $FRPS_LOG &
 FRPS_PID=$!
-echo "- frps_demo server started (PID: $FRPS_PID)"
+echo "- frps server started (PID: $FRPS_PID)"
 
 wait_for_log $FRPS_LOG "FRPS listening on ports" $WAIT_TIMEOUT || exit 1
 
-./target/release/frpc_demo --client-id client_A --control-port ${TEST_CONTROL_PORT} --proxy-port ${TEST_PROXY_PORT} --local-port ${TEST_LOCAL_PORT} --email test@example.com --password 123456 &> $FRPC_A_LOG &
+./target/release/frpc --client-id client_A --control-port ${TEST_CONTROL_PORT} --proxy-port ${TEST_PROXY_PORT} --local-port ${TEST_LOCAL_PORT} --email test@example.com --password 123456 &> $FRPC_A_LOG &
 FRPC_A_PID=$!
-echo "- frpc_demo client_A started (PID: $FRPC_A_PID)"
+echo "- frpc client_A started (PID: $FRPC_A_PID)"
 
-./target/release/frpc_demo --client-id client_B --control-port ${TEST_CONTROL_PORT} --proxy-port ${TEST_PROXY_PORT} --local-port ${TEST_LOCAL_PORT} --email test@example.com --password 123456 &> $FRPC_B_LOG &
+./target/release/frpc --client-id client_B --control-port ${TEST_CONTROL_PORT} --proxy-port ${TEST_PROXY_PORT} --local-port ${TEST_LOCAL_PORT} --email test@example.com --password 123456 &> $FRPC_B_LOG &
 FRPC_B_PID=$!
-echo "- frpc_demo client_B started (PID: $FRPC_B_PID)"
+echo "- frpc client_B started (PID: $FRPC_B_PID)"
 
 
 echo "
