@@ -18,5 +18,9 @@ clap = { workspace = true }
 axum = "0.7"
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors"] }
-hyper = "1.0"
+hyper = { version = "1.4.1", features = ["full"] }
 chrono = { version = "0.4", features = ["serde"] }
+http-body-util = "0.1.2"
+futures-util = { workspace = true }
+httparse = "1.8.0"
+bytes = { workspace = true }

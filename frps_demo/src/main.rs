@@ -3,16 +3,17 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::Json,
-    routing::{delete, get, post},
+    routing::{delete, get},
     Router,
 };
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use common::{read_command, write_command, join_streams, Command};
+use common::{read_command, write_command, join_streams, Command, Model};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use httparse;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::net::tcp::{OwnedWriteHalf, OwnedReadHalf};
@@ -66,15 +67,6 @@ impl<T> ApiResponse<T> {
             timestamp: Utc::now(),
         }
     }
-
-    fn error(message: String) -> ApiResponse<()> {
-        ApiResponse {
-            success: false,
-            data: None,
-            message,
-            timestamp: Utc::now(),
-        }
-    }
 }
 
 #[derive(Serialize)]
@@ -117,11 +109,17 @@ struct HealthStatus {
     uptime_seconds: u64,
 }
 
+#[derive(Deserialize)]
+struct ChatCompletionRequest {
+    model: String,
+}
+
 struct ClientInfo {
     writer: Arc<Mutex<OwnedWriteHalf>>,
     authed: bool,
     system_info: Option<SystemInfo>,
     connected_at: DateTime<Utc>,
+    models: Option<Vec<Model>>,
 }
 
 struct User {
@@ -345,6 +343,36 @@ async fn get_client_heartbeat(
     }
 }
 
+async fn get_client_models(
+    Path(client_id): Path<String>,
+    State(app_state): State<AppState>
+) -> Result<Json<ApiResponse<Vec<Model>>>, StatusCode> {
+    let clients = app_state.active_clients.lock().await;
+    if let Some(client_info) = clients.get(&client_id) {
+        if let Some(models) = &client_info.models {
+            Ok(Json(ApiResponse::success(models.clone())))
+        } else {
+            Ok(Json(ApiResponse::success(vec![])))
+        }
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+async fn get_all_models(
+    State(app_state): State<AppState>
+) -> Result<Json<ApiResponse<HashMap<String, Vec<Model>>>>, StatusCode> {
+    let clients = app_state.active_clients.lock().await;
+    let mut all_models = HashMap::new();
+    for (client_id, client_info) in clients.iter() {
+        if let Some(models) = &client_info.models {
+            all_models.insert(client_id.clone(), models.clone());
+        }
+    }
+    Ok(Json(ApiResponse::success(all_models)))
+}
+
+
 // Connection Statistics APIs
 async fn get_stats(State(app_state): State<AppState>) -> Json<ApiResponse<ServerStats>> {
     let clients = app_state.active_clients.lock().await;
@@ -452,6 +480,8 @@ fn create_api_router(app_state: AppState) -> Router {
         // Client Management APIs
         .route("/api/clients/:client_id", delete(disconnect_client))
         .route("/api/clients/:client_id/heartbeat", get(get_client_heartbeat))
+        .route("/api/clients/:client_id/models", get(get_client_models))
+        .route("/api/models", get(get_all_models))
         
         // Connection Statistics APIs
         .route("/api/stats", get(get_stats))
@@ -600,11 +630,12 @@ async fn handle_single_client(stream: TcpStream, active_clients: ActiveClients, 
             return Err(anyhow!("Client ID already registered"));
         }
 
-        clients.insert(id.clone(), ClientInfo { 
-            writer: writer.clone(), 
+        clients.insert(id.clone(), ClientInfo {
+            writer: writer.clone(),
             authed,
             system_info: None,
             connected_at: Utc::now(),
+            models: None,
         });
         let _ = write_command(&mut *writer.lock().await, &Command::RegisterResult { success: true, error: None }).await;
         info!("Client {} registered successfully.", id);
@@ -619,11 +650,12 @@ async fn handle_single_client(stream: TcpStream, active_clients: ActiveClients, 
 async fn client_loop(reader: &mut OwnedReadHalf, client_id: String, active_clients: ActiveClients) -> Result<()> {
     loop {
         match read_command(reader).await {
-            Ok(Command::Heartbeat) => {
-                info!("Received heartbeat from client {}", client_id);
-                // Update last heartbeat time
+            Ok(Command::Heartbeat { models }) => {
+                let model_count = models.as_ref().map_or(0, |m| m.len());
+                info!("Received heartbeat from client {} with {} models", client_id, model_count);
                 let mut clients = active_clients.lock().await;
                 if let Some(client_info) = clients.get_mut(&client_id) {
+                    client_info.models = models;
                     if let Some(ref mut sys_info) = client_info.system_info {
                         sys_info.last_heartbeat = std::time::SystemTime::now();
                     } else {
@@ -712,19 +744,75 @@ async fn handle_public_connections(listener: TcpListener, active_clients: Active
     }
 }
 
-async fn route_public_connection(user_stream: TcpStream, active_clients: ActiveClients, pending_connections: PendingConnections) -> Result<()> {
-    let mut clients = active_clients.lock().await;
-    let client_ids: Vec<String> = clients.keys().cloned().collect();
-
-    if client_ids.is_empty() {
-        warn!("No active clients available to handle new public connection.");
-        return Err(anyhow!("No active clients"));
+async fn find_client_by_model(model_name: &str, clients: &mut HashMap<String, ClientInfo>) -> Option<String> {
+    for (client_id, client_info) in clients.iter() {
+        if let Some(models) = &client_info.models {
+            if models.iter().any(|m| m.id == model_name) {
+                return Some(client_id.clone());
+            }
+        }
     }
+    None
+}
 
-    let chosen_client_id = client_ids.choose(&mut rand::thread_rng()).ok_or_else(|| anyhow!("Failed to choose a client"))?;
+async fn route_public_connection(user_stream: TcpStream, active_clients: ActiveClients, pending_connections: PendingConnections) -> Result<()> {
+    let mut buffer = [0; 4096];
+    let n = user_stream.peek(&mut buffer).await?;
+    let initial_data = &buffer[..n];
+
+    let mut headers = [httparse::EMPTY_HEADER; 100];
+    let mut req = httparse::Request::new(&mut headers);
+
+    let chosen_client_id = if let Ok(httparse::Status::Complete(parsed_len)) = req.parse(initial_data) {
+        let mut clients = active_clients.lock().await;
+        if req.method == Some("POST") && req.path == Some("/v1/chat/completions") {
+            let body_offset = parsed_len;
+            let body_bytes = &initial_data[body_offset..];
+
+            // It's tricky to get the full body here as it might not be in the first packet.
+            // For now, we assume the relevant part of the JSON is in the first packet.
+            // A more robust solution would involve a proper body reading loop.
+            if let Ok(body_str) = std::str::from_utf8(body_bytes) {
+                 if let Ok(chat_req) = serde_json::from_str::<ChatCompletionRequest>(body_str) {
+                    if let Some(client_id) = find_client_by_model(&chat_req.model, &mut *clients).await {
+                        info!("Found client '{}' for model '{}'", client_id, chat_req.model);
+                        Some(client_id)
+                    } else {
+                       warn!("No client found for model '{}'. Falling back to random.", chat_req.model);
+                       None
+                    }
+                 } else {
+                    warn!("Could not parse chat completion body. Falling back to random.");
+                    None
+                 }
+            } else {
+                warn!("Could not parse body as UTF-8. Falling back to random.");
+                None
+            }
+        } else {
+            // Not a chat completion request, proceed with random selection
+            None
+        }
+    } else {
+        // Not a complete HTTP request in the first packet, or not HTTP at all.
+        None
+    };
+
+    let mut clients = active_clients.lock().await;
+    let chosen_client_id = if let Some(id) = chosen_client_id {
+        id
+    } else {
+        let client_ids: Vec<String> = clients.keys().cloned().collect();
+        if client_ids.is_empty() {
+            warn!("No active clients available to handle new public connection.");
+            return Err(anyhow!("No active clients"));
+        }
+        client_ids.choose(&mut rand::thread_rng()).ok_or_else(|| anyhow!("Failed to choose a client"))?.clone()
+    };
+
     info!("Chose client '{}' for the new connection.", chosen_client_id);
 
-    if let Some(client_info) = clients.get(chosen_client_id) {
+    if let Some(client_info) = clients.get(&chosen_client_id) {
         if !client_info.authed {
             return Err(anyhow!("Chosen client not authenticated"));
         }
@@ -738,7 +826,7 @@ async fn route_public_connection(user_stream: TcpStream, active_clients: ActiveC
         if let Err(e) = write_command(&mut *writer, &command).await {
             error!("Failed to send RequestNewProxyConn to client {}: {}. Removing from active list.", chosen_client_id, e);
             drop(writer);
-            clients.remove(chosen_client_id);
+            clients.remove(&chosen_client_id);
             pending_connections.lock().await.remove(&proxy_conn_id);
             return Err(e.into());
         }

@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use clap::Parser;
-use common::{read_command, write_command, join_streams, Command};
+use common::{read_command, write_command, join_streams, Command, Model};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Write};
@@ -57,6 +57,36 @@ struct SystemInfo {
     memory_usage: f32,
     disk_usage: f32,
 }
+
+// This struct is to deserialize the top-level JSON from Ollama API
+#[derive(Deserialize, Debug)]
+struct OllamaModelsResponse {
+    data: Vec<Model>,
+}
+
+async fn get_ollama_models() -> Result<Vec<Model>> {
+    let client = reqwest::Client::new();
+    let res = client
+        .get("http://localhost:11434/v1/models")
+        .send()
+        .await
+        .map_err(|e| anyhow!("Failed to connect to Ollama: {}", e))?;
+
+    if !res.status().is_success() {
+        return Err(anyhow!(
+            "Ollama API returned non-success status: {}",
+            res.status()
+        ));
+    }
+
+    let response: OllamaModelsResponse = res
+        .json()
+        .await
+        .map_err(|e| anyhow!("Failed to parse JSON from Ollama: {}", e))?;
+
+    Ok(response.data)
+}
+
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -140,23 +170,35 @@ async fn main() -> Result<()> {
 
     // Clone necessary variables for the heartbeat task
     let mut writer_clone = writer;
-    let args_clone = args.clone();
     
     // Spawn a task to send periodic heartbeats and system info
     tokio::spawn(async move {
-        let mut interval = interval(Duration::from_secs(30)); // Send heartbeat every 30 seconds
+        let mut interval = interval(Duration::from_secs(10)); // Send heartbeat every 10 seconds
         loop {
             interval.tick().await;
-            
-            // Send heartbeat
-            if let Err(e) = write_command(&mut writer_clone, &Command::Heartbeat).await {
+
+            // Get models from local Ollama instance
+            let models = match get_ollama_models().await {
+                Ok(models) => {
+                    info!("Successfully fetched {} models from Ollama.", models.len());
+                    Some(models)
+                }
+                Err(e) => {
+                    warn!("Could not fetch models from Ollama: {}. This is okay if Ollama is not running.", e);
+                    None
+                }
+            };
+
+            // Send heartbeat with model info
+            let heartbeat_cmd = Command::Heartbeat { models };
+            if let Err(e) = write_command(&mut writer_clone, &heartbeat_cmd).await {
                 error!("Failed to send heartbeat: {}", e);
                 break;
             }
-            
+
             // Collect and send system information
             if let Ok(sys_info) = collect_system_info().await {
-                if let Err(e) = write_command(&mut writer_clone, &Command::SystemInfo { 
+                if let Err(e) = write_command(&mut writer_clone, &Command::SystemInfo {
                     cpu_usage: sys_info.cpu_usage,
                     memory_usage: sys_info.memory_usage,
                     disk_usage: sys_info.disk_usage,

@@ -2,6 +2,14 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Model {
+    pub id: String,
+    pub object: String,
+    pub created: u64,
+    pub owned_by: String,
+}
+
 /// Commands exchanged between client and server.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Command {
@@ -38,7 +46,9 @@ pub enum Command {
         token: Option<String>,
     },
     /// Heartbeat message from client to server
-    Heartbeat,
+    Heartbeat {
+        models: Option<Vec<Model>>,
+    },
     /// System information from client to server
     SystemInfo {
         cpu_usage: f32,
