@@ -13,9 +13,9 @@ use tracing::{info, error, warn, Level};
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Unique ID for this client instance.
+    /// Unique ID for this client instance. If not provided, uses machine ID.
     #[arg(short, long)]
-    client_id: String,
+    client_id: Option<String>,
 
     /// Address of the frps server.
     #[arg(short, long, default_value = "127.0.0.1")]
@@ -93,7 +93,14 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
 
-    info!("Starting frpc with client_id: {}", args.client_id);
+    // Use machine ID if client_id is not provided
+    let client_id = args.client_id.clone().unwrap_or_else(|| {
+        let machine_id = mid::get("mySecretKey").unwrap();
+        info!("Using machine ID as client_id: {}", machine_id);
+        machine_id
+    });
+
+    info!("Starting frpc with client_id: {}", client_id);
     info!("Server address: {}:{}", args.server_addr, args.control_port);
     info!("Local service: {}:{}", args.local_addr, args.local_port);
 
@@ -150,7 +157,7 @@ async fn main() -> Result<()> {
     }
 
     // Register the client
-    let register_cmd = Command::Register { client_id: args.client_id.clone() };
+    let register_cmd = Command::Register { client_id: client_id.clone() };
     write_command(&mut writer, &register_cmd).await?;
 
     // Wait for registration result
@@ -216,8 +223,9 @@ async fn main() -> Result<()> {
             Ok(Command::RequestNewProxyConn { proxy_conn_id }) => {
                 info!("Received request for new proxy connection: {}", proxy_conn_id);
                 let args_clone = args.clone();
+                let client_id_clone = client_id.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = create_proxy_connection(args_clone, proxy_conn_id).await {
+                    if let Err(e) = create_proxy_connection(args_clone, client_id_clone, proxy_conn_id).await {
                         error!("Failed to create proxy connection: {}", e);
                     }
                 });
@@ -239,7 +247,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn create_proxy_connection(args: Args, proxy_conn_id: String) -> Result<()> {
+async fn create_proxy_connection(args: Args, _client_id: String, proxy_conn_id: String) -> Result<()> {
     let mut proxy_stream = TcpStream::connect(format!("{}:{}", args.server_addr, args.proxy_port)).await?;
     info!("('{}') Connected to proxy port.", proxy_conn_id);
 

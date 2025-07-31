@@ -107,7 +107,7 @@ When starting the server for the first time, you'll need to authenticate with cr
 
 ### 4. Start Multiple Clients (`frpc`)
 
-To see the load balancing in action, you need to start at least two client instances. Each client **must have a unique `--client-id`**.
+To see the load balancing in action, you need to start at least two client instances. Each client will automatically use a unique machine ID as its identifier if not explicitly specified.
 
 On first run, each client will prompt for authentication credentials:
 - Email: `test@example.com`
@@ -125,7 +125,12 @@ cargo run --release --bin frpc -- --client-id client_A
 cargo run --release --bin frpc -- --client-id client_B
 ```
 
-Check the server logs to confirm that both clients have successfully registered.
+**Terminal 3 - Client with automatic ID:**
+```bash
+cargo run --release --bin frpc
+```
+
+Check the server logs to confirm that all clients have successfully registered.
 
 ### 5. Test the Load Balancing
 
@@ -202,11 +207,11 @@ Options:
 The `frpc` client can be configured via command-line arguments:
 
 ```
-Usage: frpc [OPTIONS] --client-id <CLIENT_ID>
+Usage: frpc [OPTIONS]
 
 Options:
   -c, --client-id <CLIENT_ID>
-          Unique ID for this client instance.
+          Unique ID for this client instance. If not provided, uses machine ID.
   -s, --server-addr <SERVER_ADDR>
           Address of the frps server.
           [default: 127.0.0.1]
