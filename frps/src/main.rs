@@ -174,6 +174,28 @@ async fn validate_token_in_db(pool: &Pool<Postgres>, token: &str) -> Result<bool
     Ok(row.is_some())
 }
 
+async fn upsert_client_info(pool: &Pool<Postgres>, user_id: &str, machine_id: &str, name: &str, status: &str) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO "public"."gpu_assets" ("userId", "machineId", "name", "createdAt", "updatedAt")
+        VALUES ($1, $2, $3, NOW(), NOW())
+        ON CONFLICT ("machineId")
+        DO UPDATE SET
+            "name" = EXCLUDED."name",
+            "status" = 'online'::gpu_asset_status,
+            "updatedAt" = NOW();
+        "#
+    )
+    .bind(user_id)
+    .bind(machine_id)
+    .bind(name)
+    // .bind(status)
+    .execute(pool)
+    .await?;
+    
+    Ok(())
+}
+
 // API Handlers
 
 // Client Query APIs
@@ -694,10 +716,10 @@ async fn handle_single_client(stream: TcpStream, active_clients: ActiveClients, 
         return Err(anyhow!("Second command was not Register"));
     };
 
-    client_loop(&mut reader, client_id, active_clients).await
+    client_loop(&mut reader, client_id, active_clients, db_pool).await
 }
 
-async fn client_loop(reader: &mut OwnedReadHalf, client_id: String, active_clients: ActiveClients) -> Result<()> {
+async fn client_loop(reader: &mut OwnedReadHalf, client_id: String, active_clients: ActiveClients, db_pool: Arc<Pool<Postgres>>) -> Result<()> {
     loop {
         match read_command(reader).await {
             Ok(Command::Heartbeat { models }) => {
@@ -718,10 +740,17 @@ async fn client_loop(reader: &mut OwnedReadHalf, client_id: String, active_clien
                     }
                 }
             }
-            Ok(Command::SystemInfo { cpu_usage, memory_usage, disk_usage }) => {
-                info!("Received system info from client {}: CPU: {:.2}%, Memory: {:.2}%, Disk: {:.2}%", 
-                      client_id, cpu_usage, memory_usage, disk_usage);
-                // Update system info
+            Ok(Command::SystemInfo { cpu_usage, memory_usage, disk_usage, computer_name }) => {
+                info!("Received system info from client {}: CPU: {:.2}%, Memory: {:.2}%, Disk: {:.2}%, Computer: {}", 
+                      client_id, cpu_usage, memory_usage, disk_usage, computer_name);
+                
+                // Store client info in database
+                let user_id = "S70Nu1PGu1WYU4EbzePOJA9HsFsRspIQ";
+                if let Err(e) = upsert_client_info(&db_pool, user_id, &client_id, &computer_name, "online").await {
+                    error!("Failed to store client info in database: {}", e);
+                }
+                
+                // Update system info in memory
                 let mut clients = active_clients.lock().await;
                 if let Some(client_info) = clients.get_mut(&client_id) {
                     client_info.system_info = Some(SystemInfo {
@@ -737,6 +766,15 @@ async fn client_loop(reader: &mut OwnedReadHalf, client_id: String, active_clien
             }
             Err(_) => {
                 warn!("Client {} disconnected.", client_id);
+                
+                // Update client status in database to offline
+                if let Err(e) = sqlx::query("UPDATE \"public\".\"gpu_assets\" SET status = 'offline', \"updatedAt\" = NOW() WHERE \"machineId\" = $1")
+                    .bind(&client_id)
+                    .execute(&*db_pool)
+                    .await {
+                    error!("Failed to update client status to offline in database: {}", e);
+                }
+                
                 active_clients.lock().await.remove(&client_id);
                 break;
             }

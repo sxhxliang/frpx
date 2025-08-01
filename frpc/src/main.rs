@@ -10,6 +10,24 @@ use tokio::net::TcpStream;
 use tokio::time::interval;
 use tracing::{info, error, warn, Level};
 
+fn get_computer_name() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".to_string())
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        std::process::Command::new("hostname")
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .unwrap_or_else(|_| "unknown".to_string())
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        "unknown".to_string()
+    }
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -56,6 +74,7 @@ struct SystemInfo {
     cpu_usage: f32,
     memory_usage: f32,
     disk_usage: f32,
+    computer_name: String,
 }
 
 // This struct is to deserialize the top-level JSON from Ollama API
@@ -209,6 +228,7 @@ async fn main() -> Result<()> {
                     cpu_usage: sys_info.cpu_usage,
                     memory_usage: sys_info.memory_usage,
                     disk_usage: sys_info.disk_usage,
+                    computer_name: sys_info.computer_name,
                 }).await {
                     error!("Failed to send system info: {}", e);
                     break;
@@ -326,6 +346,7 @@ async fn collect_system_info() -> Result<SystemInfo> {
         cpu_usage,
         memory_usage,
         disk_usage,
+        computer_name: get_computer_name(),
     })
 }
 
@@ -413,6 +434,7 @@ async fn collect_system_info() -> Result<SystemInfo> {
         cpu_usage,
         memory_usage,
         disk_usage,
+        computer_name: get_computer_name(),
     })
 }
 
@@ -424,6 +446,7 @@ async fn collect_system_info() -> Result<SystemInfo> {
         cpu_usage: 0.0,
         memory_usage: 0.0,
         disk_usage: 0.0,
+        computer_name: get_computer_name(),
     })
 }
 
@@ -434,5 +457,6 @@ async fn collect_system_info() -> Result<SystemInfo> {
         cpu_usage: 0.0,
         memory_usage: 0.0,
         disk_usage: 0.0,
+        computer_name: get_computer_name(),
     })
 }

@@ -54,6 +54,7 @@ pub enum Command {
         cpu_usage: f32,
         memory_usage: f32,
         disk_usage: f32,
+        computer_name: String,
     },
 }
 
