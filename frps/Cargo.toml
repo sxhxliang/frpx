@@ -24,3 +24,4 @@ http-body-util = "0.1.2"
 futures-util = { workspace = true }
 httparse = "1.8.0"
 bytes = { workspace = true }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid"] }

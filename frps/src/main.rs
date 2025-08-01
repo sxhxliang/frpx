@@ -11,6 +11,7 @@ use clap::Parser;
 use common::{read_command, write_command, join_streams, Command, Model};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
+use sqlx::{Pool, Postgres, Row};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
@@ -43,6 +44,10 @@ struct Args {
     /// API key for authentication
     #[arg(long, default_value = "abc123")]
     api_key: String,
+    
+    /// Database URL for PostgreSQL connection
+    #[arg(long, default_value = "postgres://username:password@localhost/database")]
+    database_url: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -149,12 +154,25 @@ struct AppState {
     server_start_time: DateTime<Utc>,
     total_connections: Arc<Mutex<u64>>,
     config: ServerConfig,
+    db_pool: Arc<Pool<Postgres>>,
 }
 
 type UserDb = Arc<Mutex<HashMap<String, User>>>;
 type TokenDb = Arc<Mutex<HashMap<String, String>>>;
 type ActiveClients = Arc<Mutex<HashMap<String, ClientInfo>>>;
 type PendingConnections = Arc<Mutex<HashMap<String, TcpStream>>>;
+
+// Database functions
+async fn validate_token_in_db(pool: &Pool<Postgres>, token: &str) -> Result<bool> {
+    let row = sqlx::query(
+        "SELECT key FROM \"public\".\"api_keys\" WHERE key = $1 AND status = 'active' AND (\"expiresAt\" IS NULL OR \"expiresAt\" > NOW())"
+    )
+    .bind(token)
+    .fetch_optional(pool)
+    .await?;
+    
+    Ok(row.is_some())
+}
 
 // API Handlers
 
@@ -527,6 +545,16 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
 
+    // Initialize database pool
+    let db_pool = Arc::new(
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(10)
+            .connect(&args.database_url)
+            .await?
+    );
+    
+    info!("Connected to database successfully");
+
     let active_clients: ActiveClients = Arc::new(Mutex::new(HashMap::new()));
     let pending_connections: PendingConnections = Arc::new(Mutex::new(HashMap::new()));
     let user_db: UserDb = Arc::new(Mutex::new(HashMap::from([
@@ -550,6 +578,7 @@ async fn main() -> Result<()> {
             public_port: args.public_port,
             api_port: args.api_port,
         },
+        db_pool: db_pool.clone(),
     };
 
     let control_listener = TcpListener::bind(format!("0.0.0.0:{}", args.control_port)).await?;
@@ -566,7 +595,7 @@ async fn main() -> Result<()> {
     }
     
     let server_logic = tokio::select! {
-        res = handle_control_connections(control_listener, active_clients.clone(), user_db, token_db) => res,
+        res = handle_control_connections(control_listener, active_clients.clone(), user_db, token_db, db_pool.clone()) => res,
         res = handle_proxy_connections(proxy_listener, pending_connections.clone()) => res,
         res = handle_public_connections(public_listener, active_clients.clone(), pending_connections.clone(), total_connections.clone(), args.api_key.clone()) => res,
         res = run_api_server(app_state, args.api_port) => res,
@@ -579,22 +608,23 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn handle_control_connections(listener: TcpListener, active_clients: ActiveClients, user_db: UserDb, token_db: TokenDb) -> Result<()> {
+async fn handle_control_connections(listener: TcpListener, active_clients: ActiveClients, user_db: UserDb, token_db: TokenDb, db_pool: Arc<Pool<Postgres>>) -> Result<()> {
     loop {
         let (stream, addr) = listener.accept().await?;
         info!("New control connection from: {}", addr);
         let active_clients_clone = active_clients.clone();
         let user_db_clone = user_db.clone();
         let token_db_clone = token_db.clone();
+        let db_pool_clone = db_pool.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_single_client(stream, active_clients_clone, user_db_clone, token_db_clone).await {
+            if let Err(e) = handle_single_client(stream, active_clients_clone, user_db_clone, token_db_clone, db_pool_clone).await {
                 error!("Error handling client {}: {}", addr, e);
             }
         });
     }
 }
 
-async fn handle_single_client(stream: TcpStream, active_clients: ActiveClients, user_db: UserDb, token_db: TokenDb) -> Result<()> {
+async fn handle_single_client(stream: TcpStream, active_clients: ActiveClients, user_db: UserDb, token_db: TokenDb, db_pool: Arc<Pool<Postgres>>) -> Result<()> {
     let (mut reader, writer) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer));
     let mut authed = false;
@@ -617,12 +647,19 @@ async fn handle_single_client(stream: TcpStream, active_clients: ActiveClients, 
             }
         }
         Command::LoginByToken { token } => {
-            let tokens = token_db.lock().await;
-            if tokens.contains_key(&token) {
-                let _ = write_command(&mut *writer.lock().await, &Command::LoginResult { success: true, error: None, token: None }).await;
-                authed = true;
-            } else {
-                let _ = write_command(&mut *writer.lock().await, &Command::LoginResult { success: false, error: Some("Invalid token".to_string()), token: None }).await;
+            match validate_token_in_db(&db_pool, &token).await {
+                Ok(is_valid) => {
+                    if is_valid {
+                        let _ = write_command(&mut *writer.lock().await, &Command::LoginResult { success: true, error: None, token: None }).await;
+                        authed = true;
+                    } else {
+                        let _ = write_command(&mut *writer.lock().await, &Command::LoginResult { success: false, error: Some("Invalid token".to_string()), token: None }).await;
+                    }
+                }
+                Err(e) => {
+                    error!("Database error during token validation: {}", e);
+                    let _ = write_command(&mut *writer.lock().await, &Command::LoginResult { success: false, error: Some("Database error".to_string()), token: None }).await;
+                }
             }
         }
         _ => {
