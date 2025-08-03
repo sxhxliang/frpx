@@ -12,6 +12,7 @@ use common::{read_command, write_command, join_streams, Command, Model};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Postgres, Row};
+use redis::{Client as RedisClient, Commands};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
@@ -48,6 +49,10 @@ struct Args {
     /// Database URL for PostgreSQL connection
     #[arg(long, default_value = "postgres://username:password@localhost/database")]
     database_url: String,
+    
+    /// Redis URL for caching
+    #[arg(long, default_value = "redis://127.0.0.1:6379")]
+    redis_url: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -163,7 +168,25 @@ type ActiveClients = Arc<Mutex<HashMap<String, ClientInfo>>>;
 type PendingConnections = Arc<Mutex<HashMap<String, TcpStream>>>;
 
 // Database functions
-async fn validate_token_in_db(pool: &Pool<Postgres>, token: &str) -> Result<bool> {
+async fn validate_token_in_db(pool: &Pool<Postgres>, redis_client: &RedisClient, token: &str) -> Result<bool> {
+    // Try to get from Redis cache first
+    let cache_key = format!("token:{}", token);
+    
+    // Get Redis connection
+    let mut redis_conn = redis_client.get_connection()?;
+    
+    // Check if token is cached
+    let cached_result: Option<String> = redis_conn.get(&cache_key).unwrap_or(None);
+    
+    if let Some(cached) = cached_result {
+        if cached == "valid" {
+            return Ok(true);
+        } else if cached == "invalid" {
+            return Ok(false);
+        }
+    }
+    
+    // Not in cache, query database
     let row = sqlx::query(
         "SELECT key FROM \"public\".\"api_keys\" WHERE key = $1 AND status = 'active' AND (\"expiresAt\" IS NULL OR \"expiresAt\" > NOW())"
     )
@@ -171,7 +194,13 @@ async fn validate_token_in_db(pool: &Pool<Postgres>, token: &str) -> Result<bool
     .fetch_optional(pool)
     .await?;
     
-    Ok(row.is_some())
+    let is_valid = row.is_some();
+    
+    // Cache the result for 5 minutes (300 seconds)
+    let cache_value = if is_valid { "valid" } else { "invalid" };
+    let _: () = redis_conn.set_ex(&cache_key, cache_value, 300)?;
+    
+    Ok(is_valid)
 }
 
 async fn upsert_client_info(pool: &Pool<Postgres>, user_id: &str, machine_id: &str, name: &str, status: &str) -> Result<()> {
@@ -577,6 +606,11 @@ async fn main() -> Result<()> {
     
     info!("Connected to database successfully");
 
+    // Initialize Redis client
+    let redis_client = Arc::new(RedisClient::open(args.redis_url.as_str())?);
+    
+    info!("Connected to Redis successfully");
+
     let active_clients: ActiveClients = Arc::new(Mutex::new(HashMap::new()));
     let pending_connections: PendingConnections = Arc::new(Mutex::new(HashMap::new()));
     let user_db: UserDb = Arc::new(Mutex::new(HashMap::from([
@@ -617,9 +651,9 @@ async fn main() -> Result<()> {
     }
     
     let server_logic = tokio::select! {
-        res = handle_control_connections(control_listener, active_clients.clone(), user_db, token_db, db_pool.clone()) => res,
+        res = handle_control_connections(control_listener, active_clients.clone(), user_db, token_db, db_pool.clone(), redis_client.clone()) => res,
         res = handle_proxy_connections(proxy_listener, pending_connections.clone()) => res,
-        res = handle_public_connections(public_listener, active_clients.clone(), pending_connections.clone(), total_connections.clone(), args.api_key.clone()) => res,
+        res = handle_public_connections(public_listener, active_clients.clone(), pending_connections.clone(), total_connections.clone(), args.api_key.clone(), db_pool.clone(), redis_client.clone()) => res,
         res = run_api_server(app_state, args.api_port) => res,
     };
 
@@ -630,7 +664,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn handle_control_connections(listener: TcpListener, active_clients: ActiveClients, user_db: UserDb, token_db: TokenDb, db_pool: Arc<Pool<Postgres>>) -> Result<()> {
+async fn handle_control_connections(listener: TcpListener, active_clients: ActiveClients, user_db: UserDb, token_db: TokenDb, db_pool: Arc<Pool<Postgres>>, redis_client: Arc<RedisClient>) -> Result<()> {
     loop {
         let (stream, addr) = listener.accept().await?;
         info!("New control connection from: {}", addr);
@@ -638,15 +672,16 @@ async fn handle_control_connections(listener: TcpListener, active_clients: Activ
         let user_db_clone = user_db.clone();
         let token_db_clone = token_db.clone();
         let db_pool_clone = db_pool.clone();
+        let redis_client_clone = redis_client.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_single_client(stream, active_clients_clone, user_db_clone, token_db_clone, db_pool_clone).await {
+            if let Err(e) = handle_single_client(stream, active_clients_clone, user_db_clone, token_db_clone, db_pool_clone, redis_client_clone).await {
                 error!("Error handling client {}: {}", addr, e);
             }
         });
     }
 }
 
-async fn handle_single_client(stream: TcpStream, active_clients: ActiveClients, user_db: UserDb, token_db: TokenDb, db_pool: Arc<Pool<Postgres>>) -> Result<()> {
+async fn handle_single_client(stream: TcpStream, active_clients: ActiveClients, user_db: UserDb, token_db: TokenDb, db_pool: Arc<Pool<Postgres>>, redis_client: Arc<RedisClient>) -> Result<()> {
     let (mut reader, writer) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer));
     let mut authed = false;
@@ -669,7 +704,7 @@ async fn handle_single_client(stream: TcpStream, active_clients: ActiveClients, 
             }
         }
         Command::LoginByToken { token } => {
-            match validate_token_in_db(&db_pool, &token).await {
+            match validate_token_in_db(&db_pool, &redis_client, &token).await {
                 Ok(is_valid) => {
                     if is_valid {
                         let _ = write_command(&mut *writer.lock().await, &Command::LoginResult { success: true, error: None, token: None }).await;
@@ -810,7 +845,7 @@ async fn handle_proxy_connections(listener: TcpListener, pending_connections: Pe
     }
 }
 
-async fn handle_public_connections(listener: TcpListener, active_clients: ActiveClients, pending_connections: PendingConnections, total_connections: Arc<Mutex<u64>>, api_key: String) -> Result<()> {
+async fn handle_public_connections(listener: TcpListener, active_clients: ActiveClients, pending_connections: PendingConnections, total_connections: Arc<Mutex<u64>>, api_key: String, db_pool: Arc<Pool<Postgres>>, redis_client: Arc<RedisClient>) -> Result<()> {
     loop {
         let (user_stream, addr) = listener.accept().await?;
         info!("New public connection from: {}", addr);
@@ -818,6 +853,8 @@ async fn handle_public_connections(listener: TcpListener, active_clients: Active
         let pending_connections_clone = pending_connections.clone();
         let total_connections_clone = total_connections.clone();
         let api_key = api_key.clone();
+        let db_pool_clone = db_pool.clone();
+        let redis_client_clone = redis_client.clone();
 
         tokio::spawn(async move {
             // Increment total connections counter
@@ -826,7 +863,7 @@ async fn handle_public_connections(listener: TcpListener, active_clients: Active
                 *counter += 1;
             }
             
-            if let Err(e) = route_public_connection(user_stream, active_clients_clone, pending_connections_clone, api_key.clone()).await {
+            if let Err(e) = route_public_connection(user_stream, active_clients_clone, pending_connections_clone, api_key.clone(), db_pool_clone, redis_client_clone).await {
                 error!("Failed to route public connection from {}: {}", addr, e);
             }
         });
@@ -866,7 +903,7 @@ async fn find_client_by_model(model_name: &str, clients: &mut HashMap<String, Cl
     None
 }
 
-async fn route_public_connection(user_stream: TcpStream, active_clients: ActiveClients, pending_connections: PendingConnections, api_key: String) -> Result<()> {
+async fn route_public_connection(user_stream: TcpStream, active_clients: ActiveClients, pending_connections: PendingConnections, api_key: String, db_pool: Arc<Pool<Postgres>>, redis_client: Arc<RedisClient>) -> Result<()> {
     let mut buffer = [0; 4096];
     let n = user_stream.peek(&mut buffer).await?;
     let initial_data = &buffer[..n];
@@ -888,12 +925,29 @@ async fn route_public_connection(user_stream: TcpStream, active_clients: ActiveC
                 auth_value
             };
             
-            if provided_key != api_key {
-                warn!("Invalid API key provided in Authorization header");
-                if let Err(e) = send_http_error_response(user_stream, 401, "Invalid API key").await {
-                    error!("Failed to send error response: {}", e);
+            // Validate token using database with Redis caching
+            match validate_token_in_db(&db_pool, &redis_client, provided_key).await {
+                Ok(is_valid) => {
+                    if !is_valid {
+                        warn!("Invalid API key provided in Authorization header");
+                        if let Err(e) = send_http_error_response(user_stream, 401, "Invalid API key").await {
+                            error!("Failed to send error response: {}", e);
+                        }
+                        return Ok(());
+                    }
+                    // Token is valid, continue processing
                 }
-                return Ok(());
+                Err(e) => {
+                    error!("Failed to validate token: {}", e);
+                    // Fallback to static API key validation
+                    if provided_key != api_key {
+                        warn!("Invalid API key provided in Authorization header (fallback validation)");
+                        if let Err(e) = send_http_error_response(user_stream, 401, "Invalid API key").await {
+                            error!("Failed to send error response: {}", e);
+                        }
+                        return Ok(());
+                    }
+                }
             }
         } else {
             warn!("No Authorization header found");
