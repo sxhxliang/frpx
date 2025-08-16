@@ -917,6 +917,12 @@ async fn route_public_connection(user_stream: TcpStream, active_clients: ActiveC
             .find(|h| h.name.to_lowercase() == "authorization")
             .and_then(|h| std::str::from_utf8(h.value).ok());
         
+        // Check for client_id header to directly specify which client to use
+        let client_id_header = req.headers.iter()
+            .find(|h| h.name.to_lowercase() == "client_id")
+            .and_then(|h| std::str::from_utf8(h.value).ok())
+            .map(|s| s.to_string());
+        
         if let Some(auth_value) = auth_header {
             // Support both "Bearer <token>" and plain token formats
             let provided_key = if auth_value.to_lowercase().starts_with("bearer ") {
@@ -958,7 +964,17 @@ async fn route_public_connection(user_stream: TcpStream, active_clients: ActiveC
         }
         
         let mut clients = active_clients.lock().await;
-        if req.method == Some("POST") && req.path == Some("/v1/chat/completions") {
+        
+        // If client_id header is present, use it directly
+        if let Some(client_id) = client_id_header {
+            if clients.contains_key(&client_id) {
+                info!("Using client '{}' specified by client_id header", client_id);
+                Some(client_id)
+            } else {
+                warn!("Client '{}' specified by client_id header not found. Falling back to other selection methods.", client_id);
+                None
+            }
+        } else if req.method == Some("POST") && req.path == Some("/v1/chat/completions") {
             let body_offset = parsed_len;
             let body_bytes = &initial_data[body_offset..];
 
